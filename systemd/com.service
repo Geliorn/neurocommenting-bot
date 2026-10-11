@@ -1,0 +1,16 @@
+[Unit]
+Description=CommentBot
+After=syslog.target
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ComBot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/ComBot/venv/bin/python /root/ComBot/app.py
+RestartSec=3
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

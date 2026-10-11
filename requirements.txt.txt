@@ -1,0 +1,5 @@
+pyaes==1.6.1
+PySocks==1.7.1
+requests==2.32.3
+XlsxWriter==3.2.0
+https://github.com/KurimuzonAkuma/pyrogram/archive/refs/heads/dev.zip

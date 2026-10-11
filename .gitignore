@@ -1,0 +1,37 @@
+# Секреты и токены
+config.py
+tw_token.txt
+tw_agent_id.txt
+OpenAI_Token.txt
+gpt_proxy.txt
+
+# Сессии Pyrogram
+*.session
+*.session-journal
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code local settings (may contain tokens)
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Архив исходников
+Build/
