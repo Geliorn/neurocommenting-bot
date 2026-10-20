@@ -56,6 +56,9 @@ with sqlite3.connect("database.db") as connection:
         'ALTER TABLE workers ADD COLUMN likes_big INT DEFAULT 0',
         'ALTER TABLE workers ADD COLUMN likes_notify INT DEFAULT 0',
 
+        'ALTER TABLE managers ADD COLUMN ai_token TEXT',
+        'ALTER TABLE managers ADD COLUMN ai_model TEXT',
+
         # журнал событий для статистики и монитора
         'CREATE TABLE IF NOT EXISTS events'
         '(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT, kind TEXT NOT NULL, '

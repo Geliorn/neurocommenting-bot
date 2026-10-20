@@ -1,9 +1,5 @@
 # Секреты и токены
 config.py
-tw_token.txt
-tw_agent_id.txt
-OpenAI_Token.txt
-gpt_proxy.txt
 
 # Сессии Pyrogram
 *.session

@@ -25,11 +25,19 @@ from pyrogram.raw.functions.contacts import Search
 from handlers import add_handler, remove_handler, is_handler
 from menus import pretexts_menu
 from sqlite_functions import sql_select, sql_edit, core_commands
-from config import API_ID, API_HASH, BOT_ID, BOT_LINK, BOT_TOKEN, ADMINS, AI_TOKEN, AI_AGENT_ID
+from config import API_ID, API_HASH, BOT_ID, BOT_LINK, BOT_TOKEN, ADMINS, AI_TOKEN
 try:
     from config import PROXY
 except ImportError:
     PROXY = None
+try:
+    from config import AI_MODEL
+except ImportError:
+    AI_MODEL = 'deepseek-chat'
+try:
+    from config import AI_BASE_URL
+except ImportError:
+    AI_BASE_URL = 'https://api.deepseek.com/v1'
 
 # важное
 
@@ -46,7 +54,11 @@ STARTED_AT = time.time()
 
 running_broadcasts = set()
 
-AI_API_BASE = 'https://agent.timeweb.cloud/api/v1/cloud-ai/agents'
+AI_API_BASE = AI_BASE_URL
+
+# таймаут запроса к ИИ: (на соединение, на ответ) — без него зависший провайдер держал бы бота вечно
+
+AI_TIMEOUT = (10, 120)
 
 conversation_history = ["Привет, как дела?", "Все отлично! Как я могу помочь вам?"]
 
@@ -177,8 +189,9 @@ async def menu(message):
         keyboard.append([InlineKeyboardButton('Поиск каналов 🔎', callback_data='search')])
     
     keyboard.append([InlineKeyboardButton('Канал уведомлений 🥰', callback_data='service channel')])
-    keyboard.append([InlineKeyboardButton('Токен AI ♻️', callback_data='token')])
-    keyboard.append([InlineKeyboardButton('Agent ID AI 🖥️', callback_data='proxy')])
+    _, current_model = ai_settings()
+    keyboard.append([InlineKeyboardButton('Ключ AI ♻️', callback_data='token')])
+    keyboard.append([InlineKeyboardButton(f'Модель AI: {current_model} 🧠', callback_data='ai_model')])
     keyboard.append([InlineKeyboardButton('Новый бот для управления 🤖', callback_data='bot')])
     keyboard.append([InlineKeyboardButton('Администраторы бота 👥', callback_data='manage_admins'),
                      InlineKeyboardButton('Общий прокси 🌐', callback_data='set_global_proxy')])
@@ -201,32 +214,48 @@ async def notify(text):
         print(f'[notify] ошибка отправки в канал: {e}')
 
 
-def _timeweb_headers():
+def ai_settings():
+    """Ключ и модель: из базы, если заданы через меню, иначе из config.py."""
+    row = sql_select('SELECT ai_token, ai_model FROM managers LIMIT 1')
+    token = row[0][0] if row and row[0] and row[0][0] else AI_TOKEN
+    model = row[0][1] if row and row[0] and row[0][1] else AI_MODEL
+    return token, model
+
+
+def _ai_headers(token):
     return {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {AI_TOKEN}',
+        'Authorization': f'Bearer {token}',
     }
 
-def _timeweb_url():
-    return f'{AI_API_BASE}/{AI_AGENT_ID}/v1/chat/completions'
 
-def generate_keywords(keyword):
-    url = _timeweb_url()
-    headers = _timeweb_headers()
+def _ai_url():
+    return f'{AI_API_BASE.rstrip("/")}/chat/completions'
+
+async def generate_keywords(keyword):
+    token, model = ai_settings()
+    url = _ai_url()
+    headers = _ai_headers(token)
 
     conversation_history.append(f'подбери 10 похожих ключевых слов к запросу "{keyword}" для поиска телеграм каналов')
 
     data = {
-        'model': 'gpt-4',
+        'model': model,
         'messages': [
             {"role": "system", "content": "Ты полезный помощник."},
             {"role": "user", "content": conversation_history[-1]},
         ]
     }
 
-    gptreq = requests.post(url, headers=headers, json=data)
+    try:
+        gptreq = await asyncio.to_thread(requests.post, url, headers=headers, json=data, timeout=AI_TIMEOUT)
+    except Exception as e:
+        print(f'[generate_keywords] {e}')
+        log_event(None, 'ai', ok=0, detail=e)
+        return 'insufficient_quota'
 
     if 'error' in gptreq.json():
+        log_event(None, 'ai', ok=0, detail=gptreq.text[:300])
         return 'insufficient_quota'
 
     assistant_reply = gptreq.json()["choices"][0]['message']['content']
@@ -239,20 +268,21 @@ def generate_keywords(keyword):
     
 async def generate_response(prompt, role, app):
     try:
-        url = _timeweb_url()
-        headers = _timeweb_headers()
+        token, model = ai_settings()
+        url = _ai_url()
+        headers = _ai_headers(token)
 
         conversation_history.append(prompt)
 
         data = {
-            'model': 'gpt-4',
+            'model': model,
             'messages': [
                 {"role": "system", "content": role},
                 {"role": "user", "content": conversation_history[-1]},
             ]
         }
 
-        gptreq = requests.post(url, headers=headers, json=data)
+        gptreq = await asyncio.to_thread(requests.post, url, headers=headers, json=data, timeout=AI_TIMEOUT)
 
         if gptreq.status_code == 200:
 
@@ -266,27 +296,37 @@ async def generate_response(prompt, role, app):
             return assistant_reply
 
         else:
+            try:
+                reason = gptreq.json()["error"]["message"]
+            except Exception:
+                reason = gptreq.text[:300]
+
+            log_event(None, 'ai', ok=0, detail=f'[{gptreq.status_code}] {reason}')
+
             for admin in admins:
                 try:
                     await app.send_message(
-                        admin, f'Ошибка при запросе к AI: [{gptreq.status_code}] {gptreq.json()["error"]["message"]}')
-                except:
+                        admin, f'Ошибка при запросе к AI: [{gptreq.status_code}] {reason}')
+                except Exception:
                     pass
 
     except Exception as e:
-        print(e)
+        print(f'[generate_response] {e}')
+        log_event(None, 'ai', ok=0, detail=e)
 
 
 async def generate_dialogue(history, system_role, extra_prompt=''):
     """history: list of {'role': 'user'/'assistant', 'content': str}"""
     try:
-        url = _timeweb_url()
-        headers = _timeweb_headers()
+        token, model = ai_settings()
+        url = _ai_url()
+        headers = _ai_headers(token)
         system_content = system_role
         if extra_prompt:
             system_content += f'\n\n{extra_prompt}'
         messages = [{"role": "system", "content": system_content}] + history
-        gptreq = requests.post(url, headers=headers, json={'model': 'gpt-4', 'messages': messages})
+        gptreq = await asyncio.to_thread(requests.post, url, headers=headers,
+                                         json={'model': model, 'messages': messages}, timeout=AI_TIMEOUT)
         if gptreq.status_code == 200:
             reply = gptreq.json()["choices"][0]['message']['content']
             if reply.startswith('"') and reply.endswith('"'):
@@ -294,9 +334,11 @@ async def generate_dialogue(history, system_role, extra_prompt=''):
             return reply
         else:
             print(f'[generate_dialogue] error {gptreq.status_code}: {gptreq.text}')
+            log_event(None, 'ai', ok=0, detail=f'[{gptreq.status_code}] {gptreq.text[:300]}')
             return None
     except Exception as e:
         print(f'[generate_dialogue] exception: {e}')
+        log_event(None, 'ai', ok=0, detail=e)
         return None
 
 
@@ -689,7 +731,7 @@ def setup_manager(app):
                     notification = await msg.reply(
                         'Ждём, пока AI подберёт ключевые слова... 😊')
                     
-                    keywords = generate_keywords(message.text)
+                    keywords = await generate_keywords(message.text)
                     keywords = keywords.split('\n')
                     
                     keywords_to_remove = []
@@ -2703,7 +2745,7 @@ def setup_manager(app):
                             'Ждём, пока AI подберёт ключевые слова... 😊')
                         
 
-                        keywords = generate_keywords(message.text)
+                        keywords = await generate_keywords(message.text)
                         keywords = keywords.split('\n')
                         
                         keywords_to_remove = []
@@ -2938,9 +2980,12 @@ def setup_manager(app):
         
         elif data.startswith('token'):
             
-            sent = await app.send_message(callback_query.from_user.id,
-                                          "🤖 Введите Bearer-токен AI:",
-                                          reply_markup=ReplyKeyboardMarkup([['Отмена ❌']], resize_keyboard=True))
+            sent = await app.send_message(
+                callback_query.from_user.id,
+                '🤖 Введите ключ API DeepSeek:\n\n'
+                'Создаётся на <a href="https://platform.deepseek.com/api_keys">platform.deepseek.com</a> → API keys',
+                reply_markup=ReplyKeyboardMarkup([['Отмена ❌']], resize_keyboard=True),
+                disable_web_page_preview=True)
 
             async def wait(token):
 
@@ -2959,11 +3004,9 @@ def setup_manager(app):
 
                 try:
 
-                    F = open('tw_token.txt', 'w', encoding='utf-8')
-                    F.write(token.text.strip())
-                    F.close()
+                    sql_edit('UPDATE managers SET ai_token = ?', (token.text.strip(),))
 
-                    sent2 = await app.send_message(callback_query.from_user.id, "👌 Токен изменён",
+                    sent2 = await app.send_message(callback_query.from_user.id, "👌 Ключ AI изменён",
                                                    reply_markup=MAIN_KEYBOARD)
                     await asyncio.sleep(2)
                     await app.delete_messages(sent2.chat.id, sent2.id)
@@ -2973,11 +3016,16 @@ def setup_manager(app):
             
             await add_handler(callback_query.from_user.id, wait)
             
-        elif data.startswith('proxy'):
-            
+        elif data.startswith('ai_model'):
+
+            _, current_model = ai_settings()
             sent = await app.send_message(
                 callback_query.from_user.id,
-                "🤖 Введите Agent Access ID:",
+                f'🧠 Текущая модель: <code>{current_model}</code>\n\n'
+                'Введите название модели, например:\n'
+                '• <code>deepseek-chat</code> — быстрая, для комментариев\n'
+                '• <code>deepseek-reasoner</code> — рассуждающая, дороже и медленнее\n\n'
+                'Если задан свой AI_BASE_URL — название модели этого провайдера.',
                 reply_markup=ReplyKeyboardMarkup([['Отмена ❌']], resize_keyboard=True))
 
             async def wait(token):
@@ -2997,12 +3045,12 @@ def setup_manager(app):
 
                 try:
 
-                    f = open('tw_agent_id.txt', 'w', encoding='utf-8')
-                    f.write(token.text.strip())
-                    f.close()
+                    sql_edit('UPDATE managers SET ai_model = ?', (token.text.strip(),))
 
-                    sent2 = await app.send_message(callback_query.from_user.id, "👌 Agent ID изменён",
-                                                   reply_markup=MAIN_KEYBOARD)
+                    sent2 = await app.send_message(
+                        callback_query.from_user.id,
+                        f'👌 Модель изменена на <code>{token.text.strip()}</code>',
+                        reply_markup=MAIN_KEYBOARD)
                     await asyncio.sleep(2)
                     await app.delete_messages(sent2.chat.id, sent2.id)
 

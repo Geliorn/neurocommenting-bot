@@ -15,6 +15,10 @@ ADMINS = (123456789,)
 # MTProxy:  'mtproxy:host:port:secret'
 PROXY = None
 
-# AI API
-AI_TOKEN = 'your_bearer_token'
-AI_AGENT_ID = 'your-agent-access-id'
+# AI API (DeepSeek: https://platform.deepseek.com/api_keys)
+AI_TOKEN = 'sk-your_deepseek_api_key'
+AI_MODEL = 'deepseek-chat'          # или deepseek-reasoner
+
+# Адрес API. Подойдёт любой провайдер с OpenAI-совместимым /chat/completions,
+# например Beget AI (https://beget.com/p638550): 'https://api-llm.beget.com/v1'
+AI_BASE_URL = 'https://api.deepseek.com/v1'
