@@ -39,3 +39,7 @@ Build/
 # Состояние для монитора
 state.json
 state.json.tmp
+
+# Файлы монитора
+monitor.log
+watchdog.json

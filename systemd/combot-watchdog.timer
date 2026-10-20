@@ -1,0 +1,11 @@
+[Unit]
+Description=ComBot watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=combot-watchdog.service
+
+[Install]
+WantedBy=timers.target

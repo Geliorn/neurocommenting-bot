@@ -1,0 +1,14 @@
+[Unit]
+Description=ComBot monitor (local web page)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ComBot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/ComBot/venv/bin/python /root/ComBot/monitor.py --web --port 8787
+RestartSec=5
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

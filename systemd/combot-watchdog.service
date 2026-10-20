@@ -1,0 +1,9 @@
+[Unit]
+Description=ComBot watchdog (one check)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/ComBot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/ComBot/venv/bin/python /root/ComBot/monitor.py --watchdog
+SuccessExitStatus=0 1
