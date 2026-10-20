@@ -55,6 +55,16 @@ with sqlite3.connect("database.db") as connection:
         'ALTER TABLE workers ADD COLUMN likes_chance INT DEFAULT 1',
         'ALTER TABLE workers ADD COLUMN likes_big INT DEFAULT 0',
         'ALTER TABLE workers ADD COLUMN likes_notify INT DEFAULT 0',
+
+        # журнал событий для статистики и монитора
+        'CREATE TABLE IF NOT EXISTS events'
+        '(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT, kind TEXT NOT NULL, '
+        'chat_id TEXT, chat_title TEXT, ok INT DEFAULT 1, detail TEXT)',
+        'CREATE INDEX IF NOT EXISTS events_ts ON events(ts)',
+        'CREATE INDEX IF NOT EXISTS events_kind_ts ON events(kind, ts)',
+
+        # WAL — чтобы монитор читал базу, не мешая боту писать
+        'PRAGMA journal_mode=WAL',
     ]
 
     def sql_edit(command, args):

@@ -35,3 +35,7 @@ Thumbs.db
 
 # Архив исходников
 Build/
+
+# Состояние для монитора
+state.json
+state.json.tmp

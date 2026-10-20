@@ -1,6 +1,7 @@
 import asyncio
 import random
 import os
+import json
 import socket
 import time
 import requests
@@ -33,6 +34,18 @@ except ImportError:
 # важное
 
 SENT_TODAY = 0
+SENT_DATE = str(date.today())
+
+# файл состояния для локального монитора и интервал его обновления
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state.json')
+HEARTBEAT_INTERVAL = 30
+STARTED_AT = time.time()
+
+# какие фоновые рассылки сейчас крутятся: телефоны воркеров
+
+running_broadcasts = set()
+
 AI_API_BASE = 'https://agent.timeweb.cloud/api/v1/cloud-ai/agents'
 
 conversation_history = ["Привет, как дела?", "Все отлично! Как я могу помочь вам?"]
@@ -44,6 +57,32 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup([['Мои аккаунты 🙂'], ['Мен�
 # костыль для остановки парсинга, потом перепишу
 
 working = False
+
+
+def sent_today_count():
+    """Счётчик отправленного за сутки с автосбросом в полночь."""
+    global SENT_TODAY, SENT_DATE
+    today = str(date.today())
+    if SENT_DATE != today:
+        SENT_DATE = today
+        SENT_TODAY = 0
+    return SENT_TODAY
+
+
+def bump_sent_today():
+    global SENT_TODAY
+    sent_today_count()
+    SENT_TODAY += 1
+
+
+def log_event(session, kind, chat_id=None, chat_title=None, ok=1, detail=None):
+    """Пишем событие в журнал: отсюда монитор берёт статистику и последние ошибки."""
+    sql_edit(
+        'INSERT INTO events(ts, session, kind, chat_id, chat_title, ok, detail) VALUES(?, ?, ?, ?, ?, ?, ?)',
+        (time.time(), str(session) if session else None, kind,
+         str(chat_id) if chat_id is not None else None, chat_title, 1 if ok else 0,
+         str(detail)[:500] if detail else None))
+
 
 # настройки бота
 
@@ -811,7 +850,6 @@ def setup_manager(app):
                     #тут сделать выбор акка
                     posts = message.text.split('\n')
                     
-                    global SENT_TODAY
                     
                     for post in posts:
                         
@@ -919,7 +957,7 @@ def setup_manager(app):
                         try:
                             if sent_message:
                                 reply = await sent_message.edit(output)
-                                SENT_TODAY += 1
+                                bump_sent_today()
                                 # for admin in admins:
                                 #     for client in worker_apps:
                                 #         try:
@@ -1176,13 +1214,12 @@ def setup_manager(app):
                     
                     async for message in client.get_chat_history(chat_id[0], limit=amount):
                         
-                        global SENT_TODAY
-                        
+                            
                         settings = sql_select(f"SELECT * FROM workers WHERE session = '{client_data.phone_number}'")
 
                         await asyncio.sleep(settings[0][4])
                         
-                        if random.randint(1, settings[0][5]) == 1 and SENT_TODAY < LIMIT and (
+                        if random.randint(1, settings[0][5]) == 1 and sent_today_count() < LIMIT and (
                                 message.text or message.caption):
                             
                             if message.caption:
@@ -1261,7 +1298,7 @@ def setup_manager(app):
                             try:
                                 if sent_message:
                                     reply = await sent_message.edit(output)
-                                    SENT_TODAY += 1
+                                    bump_sent_today()
                                     # for admin in admins:
                                     #     for client in worker_apps:
                                     #         try:
@@ -3333,9 +3370,10 @@ async def broadcast_loop(app):
                 s = sql_select(f"SELECT * FROM workers WHERE session = '{phone}'")
                 if not s or not s[0][20]:
                     break
+                chat_title = chat[1] or chat[0]
                 try:
                     await app.send_message(int(chat[0]), s[0][21])
-                    chat_title = chat[1] or chat[0]
+                    log_event(phone, 'broadcast', chat[0], chat_title)
                     await notify(
                         f'📢 <b>Рассылка отправлена</b>\n\n'
                         f'Аккаунт: {client_data.first_name}\n'
@@ -3343,15 +3381,30 @@ async def broadcast_loop(app):
                         f'Текст: {s[0][21][:300]}')
                 except Exception as e:
                     print(f'broadcast send error: {e}')
+                    log_event(phone, 'broadcast', chat[0], chat_title, ok=0, detail=e)
                 await asyncio.sleep(random.randint(interval_min, interval_max))
         except Exception as e:
             print(f'broadcast_loop error: {e}')
             await asyncio.sleep(60)
 
 
+async def start_broadcast(app):
+    """Запускаем фоновую рассылку воркера — ровно один раз на аккаунт."""
+    try:
+        me = await app.get_me()
+    except Exception as e:
+        print(f'[broadcast] не получили данные воркера: {e}')
+        return
+
+    if me.phone_number in running_broadcasts:
+        return
+
+    running_broadcasts.add(me.phone_number)
+    asyncio.create_task(broadcast_loop(app))
+
+
 def setup_worker(app):
 
-    _broadcast_started = False
     _client_data_cache = None
 
     async def get_me_cached():
@@ -3360,12 +3413,11 @@ def setup_worker(app):
             _client_data_cache = await app.get_me()
         return _client_data_cache
 
+    # страховка для аккаунтов, добавленных на ходу: при старте всё поднимает run_apps()
+
     @app.on_raw_update(group=99)
     async def _start_broadcast(client, update, users, chats):
-        nonlocal _broadcast_started
-        if not _broadcast_started:
-            _broadcast_started = True
-            asyncio.create_task(broadcast_loop(client))
+        await start_broadcast(client)
 
     async def pick_allowed_emoji(chat_id, preferred):
         """Если наши реакции в чате запрещены — берём разрешённую чатом."""
@@ -3426,11 +3478,15 @@ def setup_worker(app):
                 emoji = await pick_allowed_emoji(message.chat.id, emojis)
                 if not emoji:
                     print(f'autolike: реакции недоступны в {message.chat.id}')
+                    log_event(session, 'like', message.chat.id, message.chat.title,
+                              ok=0, detail='реакции в чате запрещены')
                     return
                 await message.react(emoji, big=big)
             except FloodWait as e:
                 await asyncio.sleep(e.value + 1)
                 await message.react(emoji, big=big)
+
+            log_event(session, 'like', message.chat.id, message.chat.title, detail=emoji)
 
             if notify_flag:
                 await notify(
@@ -3442,6 +3498,11 @@ def setup_worker(app):
 
         except Exception as e:
             print(f'autolike error: {e}')
+            try:
+                log_event(None, 'like', getattr(message.chat, 'id', None),
+                          getattr(message.chat, 'title', None), ok=0, detail=e)
+            except Exception:
+                pass
 
     @app.on_message(filters.channel, group=1)
     async def autolike_channel(_, message):
@@ -3454,7 +3515,6 @@ def setup_worker(app):
     @app.on_message(filters.channel, group=2)
     async def comment(_, message):
 
-        global SENT_TODAY
         channel_message = message
         client_data = await get_me_cached()
         
@@ -3474,7 +3534,7 @@ def setup_worker(app):
                 post = message.caption or message.text or ''
                 min_post_length = settings[0][19] if len(settings[0]) > 19 and settings[0][19] else 0
 
-                if random.randint(1, settings[0][5]) == 1 and SENT_TODAY < LIMIT and post and len(post) >= min_post_length:
+                if random.randint(1, settings[0][5]) == 1 and sent_today_count() < LIMIT and post and len(post) >= min_post_length:
 
                     service_channel = sql_select('SELECT channel FROM managers')
                     
@@ -3521,6 +3581,9 @@ def setup_worker(app):
                                 #     continue
 
                             if sent_message:
+                                log_event(client_data.phone_number, 'comment',
+                                          channel_message.chat.id, channel_message.chat.title,
+                                          detail='шаблон')
                                 await notify(
                                     f'💬 <b>Шаблонный комментарий</b>\n\n'
                                     f'Аккаунт: {client_data.first_name}\n'
@@ -3540,6 +3603,8 @@ def setup_worker(app):
                             sent_message = None
 
                     except Exception as e:
+                        log_event(client_data.phone_number, 'comment',
+                                  channel_message.chat.id, channel_message.chat.title, ok=0, detail=e)
                         await notify(
                             f'❌ <b>Ошибка комментария</b>\n\n'
                             f'Аккаунт: {client_data.first_name}\n'
@@ -3554,9 +3619,11 @@ def setup_worker(app):
                     try:
                         if sent_message:
                             reply = await sent_message.edit(output)
-                            SENT_TODAY += 1
+                            bump_sent_today()
                         else:
                             reply = await message.reply(output)
+                        log_event(client_data.phone_number, 'comment',
+                                  channel_message.chat.id, channel_message.chat.title)
                         await notify(
                             f'💬 <b>Новый комментарий</b>\n\n'
                             f'Аккаунт: {client_data.first_name}\n'
@@ -3564,6 +3631,8 @@ def setup_worker(app):
                             f'{reply.link}')
 
                     except Exception as e:
+                        log_event(client_data.phone_number, 'comment',
+                                  channel_message.chat.id, channel_message.chat.title, ok=0, detail=e)
                         await notify(
                             f'❌ <b>Ошибка комментария</b>\n\n'
                             f'Аккаунт: {client_data.first_name}\n'
@@ -3573,7 +3642,6 @@ def setup_worker(app):
     @app.on_message(filters.group, group=3)
     async def comment_group(_, message):
 
-        global SENT_TODAY
         if not (message.text or message.caption):
             return
 
@@ -3591,7 +3659,7 @@ def setup_worker(app):
         post = message.caption or message.text or ''
         min_post_length = settings[0][19] if len(settings[0]) > 19 and settings[0][19] else 0
 
-        if random.randint(1, settings[0][5]) != 1 or SENT_TODAY >= LIMIT or len(post) < min_post_length:
+        if random.randint(1, settings[0][5]) != 1 or sent_today_count() >= LIMIT or len(post) < min_post_length:
             return
 
         service_channel = sql_select('SELECT channel FROM managers')
@@ -3604,6 +3672,8 @@ def setup_worker(app):
                 else:
                     sent_message = await message.reply(random.choice(emojies))
                 if sent_message:
+                    log_event(client_data.phone_number, 'comment', message.chat.id, message.chat.title,
+                              detail='шаблон')
                     await notify(
                         f'💬 <b>Шаблонный комментарий</b>\n\n'
                         f'Аккаунт: {client_data.first_name}\n'
@@ -3628,7 +3698,9 @@ def setup_worker(app):
             else:
                 reply = await message.reply(output)
 
-            SENT_TODAY += 1
+            bump_sent_today()
+
+            log_event(client_data.phone_number, 'comment', message.chat.id, message.chat.title)
 
             await notify(
                 f'💬 <b>Новый комментарий</b>\n\n'
@@ -3637,6 +3709,8 @@ def setup_worker(app):
                 f'{reply.link}')
 
         except Exception as e:
+            log_event(client_data.phone_number, 'comment', message.chat.id, message.chat.title,
+                      ok=0, detail=e)
             await notify(
                 f'❌ <b>Ошибка комментария</b>\n\n'
                 f'Аккаунт: {client_data.first_name}\n'
@@ -3704,6 +3778,8 @@ def setup_worker(app):
                 'INSERT INTO reply_history(user_id, session, role, content) VALUES(?, ?, ?, ?)',
                 (user_id, client_data.phone_number, 'assistant', dm_text))
             sender_name = message.from_user.username or message.from_user.first_name
+            log_event(client_data.phone_number, 'dm', message.chat.id, message.chat.title,
+                      detail=f'@{sender_name}')
             await notify(
                 f'📨 <b>Аутрич DM отправлен</b>\n\n'
                 f'Аккаунт: {client_data.first_name}\n'
@@ -3711,6 +3787,7 @@ def setup_worker(app):
                 f'Получатель: @{sender_name}')
         except Exception as e:
             print(f'dm_outreach error: {e}')
+            log_event(client_data.phone_number, 'dm', message.chat.id, message.chat.title, ok=0, detail=e)
             await notify(
                 f'❌ <b>Ошибка аутрич DM</b>\n\n'
                 f'Аккаунт: {client_data.first_name}\n'
@@ -3777,6 +3854,7 @@ def setup_worker(app):
                     'INSERT INTO reply_history(user_id, session, role, content) VALUES(?, ?, ?, ?)',
                     (user_id, client_data.phone_number, 'assistant', response))
                 round_num = sum(1 for h in history if h['role'] == 'assistant') + 1
+                log_event(client_data.phone_number, 'reply', message.chat.id, sender, detail='ИИ-диалог')
                 await notify(
                     f'💬 <b>ИИ-диалог (раунд {round_num}/{reply_max_rounds if reply_max_rounds else "∞"})</b>\n\n'
                     f'Аккаунт: {client_data.first_name}\n'
@@ -3787,6 +3865,7 @@ def setup_worker(app):
         elif settings[0][3] and settings[0][3] != '-':
             await asyncio.sleep(reply_delay)
             await message.reply(settings[0][3])
+            log_event(client_data.phone_number, 'reply', message.chat.id, sender, detail='статичный текст')
             await notify(
                 f'💬 <b>Автоответ отправлен</b>\n\n'
                 f'Аккаунт: {client_data.first_name}\n'
@@ -3796,6 +3875,106 @@ def setup_worker(app):
 
         else:
             await app.send_chat_action(message.chat.id, ChatAction.CANCEL)
+
+LAST_RPC_OK = {}
+
+
+async def client_state(client, is_bot=False):
+    """Живое состояние одного клиента. RPC ограничен таймаутом, чтобы не подвесить heartbeat."""
+    info = {
+        'name': client.name,
+        'is_bot': is_bot,
+        'connected': bool(client.is_connected),
+        'dc': None,
+        'proxy': client.proxy,
+        'session': None,
+        'title': None,
+        'last_rpc_ok': LAST_RPC_OK.get(client.name),
+        'error': None,
+    }
+
+    try:
+        info['dc'] = await asyncio.wait_for(client.storage.dc_id(), timeout=5)
+    except Exception:
+        pass
+
+    if not info['connected']:
+        info['error'] = 'клиент не подключён'
+        return info
+
+    try:
+        me = await asyncio.wait_for(client.get_me(), timeout=10)
+        info['title'] = me.first_name
+        info['session'] = me.username if is_bot else me.phone_number
+        info['last_rpc_ok'] = time.time()
+        LAST_RPC_OK[client.name] = info['last_rpc_ok']
+    except asyncio.TimeoutError:
+        info['error'] = 'Telegram не ответил за 10 сек'
+    except Exception as e:
+        info['error'] = str(e)[:200]
+
+    return info
+
+
+async def collect_state():
+    """Снимок состояния процесса для локального монитора."""
+    state = {
+        'schema': 1,
+        'pid': os.getpid(),
+        'started_at': STARTED_AT,
+        'ts': time.time(),
+        'interval': HEARTBEAT_INTERVAL,
+        'proxy': GLOBAL_PROXY,
+        'startup_failed': [str(item) for item in startup_failed],
+        'managers': [],
+        'workers': [],
+    }
+
+    seen = set()
+    unique_managers = []
+    for manager in manager_apps:
+        if id(manager) in seen:
+            continue
+        seen.add(id(manager))
+        unique_managers.append(manager)
+
+    targets = ([(manager, True) for manager in unique_managers] +
+               [(worker, False) for worker in worker_apps])
+
+    # опрашиваем клиентов параллельно: один зависший не задерживает остальных
+    results = await asyncio.gather(
+        *[client_state(client, is_bot=is_bot) for client, is_bot in targets],
+        return_exceptions=True)
+
+    for (client, is_bot), result in zip(targets, results):
+        if isinstance(result, BaseException):
+            result = {'name': client.name, 'is_bot': is_bot, 'connected': False,
+                      'error': str(result)[:200], 'last_rpc_ok': LAST_RPC_OK.get(client.name)}
+        state['managers' if is_bot else 'workers'].append(result)
+
+    state['processes'] = {
+        'broadcast': sorted(running_broadcasts),
+        'parsing': bool(working),
+        'tasks': len(asyncio.all_tasks()),
+    }
+
+    return state
+
+
+async def heartbeat_loop():
+    """Раз в HEARTBEAT_INTERVAL атомарно переписываем state.json."""
+    while True:
+        try:
+            state = await collect_state()
+            tmp = f'{STATE_FILE}.tmp'
+            with open(tmp, 'w', encoding='utf-8') as state_file:
+                json.dump(state, state_file, ensure_ascii=False, indent=1)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            print(f'[heartbeat] не записали состояние: {e}')
+
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
 
 async def announce_ready():
     """Пишем админам и в сервисный канал, что бот подключился к Telegram и готов к работе."""
@@ -3867,6 +4046,11 @@ async def run_apps():
         await announce_ready()
     except Exception as e:
         print(f'[ready] не смогли отправить уведомление: {e}')
+
+    for worker in worker_apps:
+        await start_broadcast(worker)
+
+    asyncio.create_task(heartbeat_loop())
 
     await idle()
 
