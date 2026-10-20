@@ -2847,36 +2847,76 @@ def setup_manager(app):
                         await add_handler(callback_query.from_user.id, finish)
 
 
+                        errors = 0
+                        consecutive = 0
+                        last_progress = 0
+                        last_error_report = 0
+
                         for message_id in msgs:
-                            if working:
 
-                                try:
-                                    client = random.choice(list(workers_list.values()))
-                                    async for message in client.get_discussion_replies(chat_id, message_id):
-
-                                        if message.from_user:
-                                            uid = message.from_user.id
-                                            if uid not in user_counts:
-                                                user_counts[uid] = {'username': None, 'count': 0}
-                                            user_counts[uid]['count'] += 1
-                                            if message.from_user.username:
-                                                user_counts[uid]['username'] = message.from_user.username
-
-                                except FloodWait as e:
-                                    await asyncio.sleep(e.value)
-
-                                except MsgIdInvalid:
-                                    invalids += 1
-                                    await sent.edit(f'Найдено {len(msgs)} постов, парсинг в процессе\n'
-                                                    f'Бот не смог получить {invalids}💬\n\n'
-                                                    f'<i>Завершить парсинг досрочно - /finish</i>')
-
-                                except Exception as e:
-                                    await callback_query.message.reply(
-                                        f'🤖 Ошибка при парсинге\n\n Застряли на сообщении с id {message_id}\n\n'
-                                        f'<pre>{e}</pre>')
-                            else:
+                            if not working:
                                 break
+
+                            # берём только живые аккаунты: с отвалившимся парсить нечем
+                            alive = [worker for worker in workers_list.values() if worker.is_connected]
+                            if not alive:
+                                await callback_query.message.reply(
+                                    '⛔️ <b>Парсинг остановлен:</b> ни один аккаунт не подключён.\n\n'
+                                    'Собранное отправлю файлами.')
+                                break
+
+                            try:
+                                client = random.choice(alive)
+                                async for message in client.get_discussion_replies(chat_id, message_id):
+
+                                    if message.from_user:
+                                        uid = message.from_user.id
+                                        if uid not in user_counts:
+                                            user_counts[uid] = {'username': None, 'count': 0}
+                                        user_counts[uid]['count'] += 1
+                                        if message.from_user.username:
+                                            user_counts[uid]['username'] = message.from_user.username
+
+                            except FloodWait as e:
+                                await asyncio.sleep(e.value)
+                                continue
+
+                            except MsgIdInvalid:
+                                # у поста просто нет обсуждения — это нормально, не считаем сбоем
+                                invalids += 1
+                                consecutive = 0
+                                if time.time() - last_progress > 20:
+                                    last_progress = time.time()
+                                    try:
+                                        await sent.edit(f'Найдено {len(msgs)} постов, парсинг в процессе\n'
+                                                        f'Бот не смог получить {invalids}💬\n\n'
+                                                        f'<i>Завершить парсинг досрочно - /finish</i>')
+                                    except Exception:
+                                        pass
+                                continue
+
+                            except Exception as e:
+                                errors += 1
+                                consecutive += 1
+
+                                # об ошибках пишем не чаще раза в минуту, иначе зальём чат
+                                if time.time() - last_error_report > 60:
+                                    last_error_report = time.time()
+                                    await callback_query.message.reply(
+                                        f'🤖 Парсинг: ошибок {errors}, последняя на посте {message_id}\n\n'
+                                        f'<pre>{e}</pre>')
+
+                                if consecutive >= 5:
+                                    await callback_query.message.reply(
+                                        f'⛔️ <b>Парсинг остановлен:</b> {consecutive} ошибок подряд.\n\n'
+                                        f'<pre>{e}</pre>\n\n'
+                                        f'Собранное отправлю файлами.')
+                                    break
+
+                                continue
+
+                            consecutive = 0
+                            await asyncio.sleep(0.2)
 
                         await remove_handler(callback_query.from_user.id)
 
@@ -3436,18 +3476,16 @@ async def broadcast_loop(app):
             await asyncio.sleep(60)
 
 
-async def start_broadcast(app):
-    """Запускаем фоновую рассылку воркера — ровно один раз на аккаунт."""
-    try:
-        me = await app.get_me()
-    except Exception as e:
-        print(f'[broadcast] не получили данные воркера: {e}')
+def start_broadcast(app):
+    """Запускаем фоновую рассылку воркера ровно один раз.
+
+    Имя сессии воркера — это его номер телефона, поэтому обходимся без RPC:
+    запрос здесь выполнялся бы на каждый апдейт и ловил FLOOD_WAIT.
+    """
+    if app.name in running_broadcasts:
         return
 
-    if me.phone_number in running_broadcasts:
-        return
-
-    running_broadcasts.add(me.phone_number)
+    running_broadcasts.add(app.name)
     asyncio.create_task(broadcast_loop(app))
 
 
@@ -3461,11 +3499,17 @@ def setup_worker(app):
             _client_data_cache = await app.get_me()
         return _client_data_cache
 
+    _broadcast_checked = False
+
     # страховка для аккаунтов, добавленных на ходу: при старте всё поднимает run_apps()
 
     @app.on_raw_update(group=99)
     async def _start_broadcast(client, update, users, chats):
-        await start_broadcast(client)
+        nonlocal _broadcast_checked
+        if _broadcast_checked:
+            return
+        _broadcast_checked = True
+        start_broadcast(client)
 
     async def pick_allowed_emoji(chat_id, preferred):
         """Если наши реакции в чате запрещены — берём разрешённую чатом."""
@@ -4096,13 +4140,17 @@ async def run_apps():
         print(f'[ready] не смогли отправить уведомление: {e}')
 
     for worker in worker_apps:
-        await start_broadcast(worker)
+        start_broadcast(worker)
 
     asyncio.create_task(heartbeat_loop())
 
     await idle()
 
-    await asyncio.gather(*[app.stop() for app in apps])
+    try:
+        await asyncio.wait_for(asyncio.gather(*[app.stop() for app in apps], return_exceptions=True),
+                               timeout=20)
+    except asyncio.TimeoutError:
+        print('Клиенты не остановились за 20 сек — выходим как есть')
 
 
 wait_for_network()
