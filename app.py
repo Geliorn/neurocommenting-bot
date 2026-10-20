@@ -1,11 +1,14 @@
 import asyncio
 import random
 import os
+import socket
+import time
 import requests
 import xlsxwriter
 from datetime import date, datetime, timezone, timedelta
 
-from pyrogram import Client, filters, compose
+from pyrogram import Client, filters, idle
+from pyrogram.utils import get_event_loop
 from pyrogram.errors import FloodWait, UserDeactivatedBan, AuthKeyDuplicated, AuthKeyUnregistered, Forbidden, UserAlreadyParticipant
 from pyrogram.errors.exceptions.bad_request_400 import MsgIdInvalid, PeerIdInvalid, ReactionInvalid
 
@@ -285,6 +288,58 @@ if _db_proxy and _db_proxy[0][0]:
     GLOBAL_PROXY = format_proxy(_db_proxy[0][0].split(':'))
 
 
+# при старте по питанию сеть поднимается позже бота — ждём её и повторяем подключение
+
+NETWORK_WAIT = 180
+CONNECT_ATTEMPTS = 3
+CONNECT_PAUSE = 10
+
+startup_failed = []
+
+
+def wait_for_network(timeout=NETWORK_WAIT):
+    """Ждём, пока станет доступен Telegram (или прокси, если он задан)."""
+    host, port = '149.154.167.51', 443
+    if GLOBAL_PROXY:
+        host, port = GLOBAL_PROXY['hostname'], GLOBAL_PROXY['port']
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                print(f'Сеть так и не появилась ({host}:{port}): {e}')
+                return False
+            print(f'Ждём сеть ({host}:{port}): {e}')
+            time.sleep(5)
+
+
+def connect_client(client, label):
+    """Подключаем клиент с повторами — одного обрыва сети не хватит, чтобы бот остался мёртвым."""
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            client.start()
+            client.get_me()
+            client.stop()
+            return True
+
+        except (UserDeactivatedBan, AuthKeyDuplicated, AuthKeyUnregistered):
+            raise
+
+        except Exception as e:
+            print(f'{label}: попытка {attempt}/{CONNECT_ATTEMPTS} не удалась — {e}')
+            try:
+                client.stop()
+            except Exception:
+                pass
+            if attempt < CONNECT_ATTEMPTS:
+                time.sleep(CONNECT_PAUSE)
+
+    return False
+
+
 def startup():
     for token in managers:
 
@@ -293,8 +348,9 @@ def startup():
         try:
             client = Client(f"bot{MANAGERS_COUNT}", api_id=API_ID, api_hash=API_HASH, bot_token=token[0], proxy=GLOBAL_PROXY)
 
-            client.start()
-            client.stop()
+            if not connect_client(client, f'Управляющий бот bot{MANAGERS_COUNT}'):
+                startup_failed.append(f'управляющий бот bot{MANAGERS_COUNT}')
+                continue
 
             apps.append(client)
             manager_apps.append(client)
@@ -325,9 +381,7 @@ def startup():
                 client = Client(session[0], api_id=API_ID, api_hash=API_HASH, proxy=GLOBAL_PROXY)
 
             try:
-                client.start()
-                client.get_me()
-                client.stop()
+                connected = connect_client(client, f'Воркер {session[0]}')
 
             except UserDeactivatedBan:
                 print(f'Worker {session[0]}: banned, removing')
@@ -337,8 +391,14 @@ def startup():
                 print(f'Worker {session[0]}: auth key duplicated, removing')
                 sql_edit(f"DELETE FROM workers WHERE session = '{session[0]}'", ())
                 continue
-            except Exception as e:
-                print(f'Worker {session[0]}: failed to connect — {e}')
+            except AuthKeyUnregistered:
+                print(f'Worker {session[0]}: auth key unregistered, removing')
+                sql_edit(f"DELETE FROM workers WHERE session = '{session[0]}'", ())
+                continue
+
+            if not connected:
+                print(f'Worker {session[0]}: не подключился, пропускаем')
+                startup_failed.append(session[0])
                 continue
 
             apps.append(client)
@@ -3737,6 +3797,87 @@ def setup_worker(app):
         else:
             await app.send_chat_action(message.chat.id, ChatAction.CANCEL)
 
+async def announce_ready():
+    """Пишем админам и в сервисный канал, что бот подключился к Telegram и готов к работе."""
+    if not manager_apps:
+        return
+
+    manager = manager_apps[0]
+    workers_info = []
+
+    for worker in worker_apps:
+        try:
+            me = await worker.get_me()
+        except Exception as e:
+            print(f'[ready] не получили данные воркера: {e}')
+            continue
+
+        session = me.phone_number
+
+        channels_row = sql_select(f"SELECT COUNT(*) FROM channels WHERE session = '{session}'")
+        channels_count = channels_row[0][0] if channels_row else 0
+
+        like_chats_row = sql_select(f"SELECT COUNT(*) FROM like_chats WHERE session = '{session}'")
+        like_chats_count = like_chats_row[0][0] if like_chats_row else 0
+
+        flags = sql_select(
+            f"SELECT likes_enabled, auto_reply_enabled, broadcast_enabled, dm_enabled "
+            f"FROM workers WHERE session = '{session}'")
+        likes_on, reply_on, broadcast_on, dm_on = flags[0] if flags else (0, 1, 0, 0)
+
+        workers_info.append(
+            f'\u2022 <b>{me.first_name}</b> (+{session})\n'
+            f'   \u2699\ufe0f каналов: {channels_count} \u00b7 '
+            f'\U0001f44d автолайки: {"\u2705" if likes_on else "\u274c"} ({like_chats_count}) \u00b7 '
+            f'\U0001f4ac автоответы: {"\u2705" if reply_on else "\u274c"} \u00b7 '
+            f'\U0001f4e2 рассылка: {"\u2705" if broadcast_on else "\u274c"} \u00b7 '
+            f'\U0001f4e8 аутрич: {"\u2705" if dm_on else "\u274c"}')
+
+    lines = [
+        '\u2705 <b>Бот подключился к Telegram и готов к работе</b>',
+        '',
+        f'Управляющих ботов: <b>{MANAGERS_COUNT}</b>',
+        f'Рабочих аккаунтов: <b>{len(workers_info)}</b>',
+    ]
+
+    if workers_info:
+        lines.append('')
+        lines.extend(workers_info)
+
+    if startup_failed:
+        lines.append('')
+        lines.append('\u26a0\ufe0f Не подключились: ' + ', '.join(str(item) for item in startup_failed))
+
+    text = '\n'.join(lines)
+
+    for admin in admins:
+        try:
+            await manager.send_message(admin, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f'[ready] не смогли написать админу {admin}: {e}')
+
+    await notify(text)
+
+
+async def run_apps():
+    """То же, что pyrogram.compose, плюс уведомление о готовности после реального подключения."""
+    await asyncio.gather(*[app.start() for app in apps])
+
+    try:
+        await announce_ready()
+    except Exception as e:
+        print(f'[ready] не смогли отправить уведомление: {e}')
+
+    await idle()
+
+    await asyncio.gather(*[app.stop() for app in apps])
+
+
+wait_for_network()
 startup()
 
-compose(apps)
+if not apps:
+    print('Ни один клиент не подключился — выходим, systemd перезапустит')
+    raise SystemExit(1)
+
+get_event_loop().run_until_complete(run_apps())
