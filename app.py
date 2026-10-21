@@ -2,6 +2,7 @@ import asyncio
 import random
 import os
 import json
+import re
 import socket
 import time
 import requests
@@ -46,7 +47,8 @@ SENT_DATE = str(date.today())
 
 # файл состояния для локального монитора и интервал его обновления
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state.json')
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BOT_DIR, 'state.json')
 HEARTBEAT_INTERVAL = 30
 STARTED_AT = time.time()
 
@@ -69,6 +71,51 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup([['Мои аккаунты 🙂'], ['Мен�
 # костыль для остановки парсинга, потом перепишу
 
 working = False
+
+
+def normalize_chat_link(text):
+    """Приводим ссылку или @юзернейм к тому, что понимает Pyrogram.
+
+    Понимает t.me, telegram.me, telegram.dog, http и https, ссылки на
+    конкретный пост и параметры запроса. Пригласительные ссылки Pyrogram
+    принимает только целиком, поэтому их не разбираем.
+    """
+    link = (text or '').strip()
+    lowered = link.lower()
+
+    if '/+' in link or '/joinchat/' in lowered:
+        return link if lowered.startswith('http') else f'https://{link.lstrip("/")}'
+
+    if link.startswith('+'):
+        return f'https://t.me/{link}'
+
+    for prefix in ('https://', 'http://'):
+        if lowered.startswith(prefix):
+            link = link[len(prefix):]
+            lowered = link.lower()
+            break
+
+    for domain in ('www.t.me/', 't.me/', 'telegram.me/', 'telegram.dog/'):
+        if lowered.startswith(domain):
+            link = link[len(domain):]
+            break
+
+    link = link.lstrip('@').split('?')[0].strip('/')
+
+    # ссылка на конкретный пост вида channel/1234 — нужен только канал
+    if '/' in link:
+        link = link.split('/')[0]
+
+    if link.lstrip('-').isdigit():
+        return int(link)
+
+    return link
+
+
+def safe_filename(name):
+    """Имя файла без слешей и прочего, что ломает open()."""
+    cleaned = re.sub(r'[^\w.@-]+', '_', str(name)).strip('_')
+    return cleaned[:80] or 'chat'
 
 
 def sent_today_count():
@@ -2815,13 +2862,8 @@ def setup_manager(app):
                     
                     if workers_list:
                     
-                        if message.text.startswith('https://t.me/'):
-                            chat_id = str(message.text[13:])
-                        elif message.text.startswith('t.me/'):
-                            chat_id = str(message.text[5:])
-                        else:
-                            chat_id = message.text
-                        
+                        chat_id = normalize_chat_link(message.text)
+
                         client = random.choice(list(workers_list.values()))
                         
                         msgs = []
@@ -2922,21 +2964,28 @@ def setup_manager(app):
 
                         sorted_users = sorted(user_counts.items(), key=lambda x: x[1]['count'], reverse=True)
 
-                        id_results = open(f"IDs {chat_id}.txt", "w+")
-                        id_results.truncate()
-                        for uid, data in sorted_users:
-                            id_results.write(f'{uid} — {data["count"]} комм.\n')
-                        id_results.close()
+                        # имя файла строим из юзернейма чата: в сырой ссылке есть слеши
+                        try:
+                            parsed_chat = await client.get_chat(chat_id)
+                            chat_label = parsed_chat.username or str(parsed_chat.id)
+                        except Exception:
+                            chat_label = str(chat_id)
 
-                        username_results = open(f"Usernames {chat_id}.txt", "w+")
-                        username_results.truncate()
-                        for uid, data in sorted_users:
-                            if data['username']:
-                                username_results.write(f'@{data["username"]} — {data["count"]} комм.\n')
-                        username_results.close()
+                        file_base = safe_filename(chat_label)
+                        ids_path = os.path.join(BOT_DIR, f'IDs {file_base}.txt')
+                        usernames_path = os.path.join(BOT_DIR, f'Usernames {file_base}.txt')
 
-                        await app.send_document(callback_query.from_user.id, f'IDs {chat_id}.txt')
-                        await app.send_document(callback_query.from_user.id, f'Usernames {chat_id}.txt')
+                        with open(ids_path, 'w', encoding='utf-8') as id_results:
+                            for uid, data in sorted_users:
+                                id_results.write(f'{uid} — {data["count"]} комм.\n')
+
+                        with open(usernames_path, 'w', encoding='utf-8') as username_results:
+                            for uid, data in sorted_users:
+                                if data['username']:
+                                    username_results.write(f'@{data["username"]} — {data["count"]} комм.\n')
+
+                        await app.send_document(callback_query.from_user.id, ids_path)
+                        await app.send_document(callback_query.from_user.id, usernames_path)
                 
                 except Exception as e:
                     await callback_query.message.reply(f'😛 {e}')
