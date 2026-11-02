@@ -59,6 +59,11 @@ with sqlite3.connect("database.db") as connection:
         'ALTER TABLE managers ADD COLUMN ai_token TEXT',
         'ALTER TABLE managers ADD COLUMN ai_model TEXT',
 
+        # результаты проверки юзернеймов: кеш и устойчивость к перезапуску
+        'CREATE TABLE IF NOT EXISTS username_checks'
+        '(username TEXT PRIMARY KEY, status TEXT NOT NULL, kind TEXT, tg_id TEXT, '
+        'name TEXT, note TEXT, checked_at REAL)',
+
         # журнал событий для статистики и монитора
         'CREATE TABLE IF NOT EXISTS events'
         '(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT, kind TEXT NOT NULL, '

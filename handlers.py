@@ -4,8 +4,12 @@ async def remove_handler(userid):
     if userid in handlers:
         handlers.pop(userid)
 
-async def add_handler(userid, function):
-    handlers[userid] = {'function': function}
+async def add_handler(userid, function, accepts_documents=False):
+    handlers[userid] = {'function': function, 'documents': accepts_documents}
+
+async def wants_documents(userid):
+    """Ждёт ли этот пользователь файл — чтобы документ не ушёл в обработчик сессий."""
+    return userid in handlers and handlers[userid].get('documents', False)
 
 async def is_handler(message):
     if message.from_user.id in handlers:

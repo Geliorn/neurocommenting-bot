@@ -1,6 +1,7 @@
 import asyncio
 import random
 import os
+import csv
 import json
 import re
 import socket
@@ -12,7 +13,8 @@ from datetime import date, datetime, timezone, timedelta
 from pyrogram import Client, filters, idle
 from pyrogram.utils import get_event_loop
 from pyrogram.errors import FloodWait, UserDeactivatedBan, AuthKeyDuplicated, AuthKeyUnregistered, Forbidden, UserAlreadyParticipant
-from pyrogram.errors.exceptions.bad_request_400 import MsgIdInvalid, PeerIdInvalid, ReactionInvalid
+from pyrogram.errors.exceptions.bad_request_400 import (MsgIdInvalid, PeerIdInvalid, ReactionInvalid,
+                                                        UsernameNotOccupied, UsernameInvalid, PeerFlood)
 
 
 from pyrogram.enums import ParseMode, ChatAction
@@ -23,7 +25,7 @@ from pyrogram.errors import SessionPasswordNeeded
 
 from pyrogram.raw.functions.contacts import Search
 
-from handlers import add_handler, remove_handler, is_handler
+from handlers import add_handler, remove_handler, is_handler, wants_documents
 from menus import pretexts_menu
 from sqlite_functions import sql_select, sql_edit, core_commands
 from config import API_ID, API_HASH, BOT_ID, BOT_LINK, BOT_TOKEN, ADMINS, AI_TOKEN
@@ -118,6 +120,215 @@ def safe_filename(name):
     return cleaned[:80] or 'chat'
 
 
+CHECK_HEADERS = ('nick', 'nickname', 'username', 'user', 'telegram', 'tg', 'логин', 'ник')
+
+
+def parse_username_list(text):
+    """Из текста или CSV достаём юзернеймы: по одному в строке, первая колонка."""
+    found = []
+    seen = set()
+
+    for number, raw_line in enumerate((text or '').splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # первая колонка, если прислали CSV
+        for separator in (';', ',', '\t'):
+            if separator in line:
+                line = line.split(separator)[0].strip()
+                break
+
+        if not line:
+            continue
+
+        # шапку таблицы в проверку не берём
+        if number == 0 and line.strip('"\' ').lower() in CHECK_HEADERS:
+            continue
+
+        username = normalize_chat_link(line.strip('"\' '))
+        if not isinstance(username, str) or not username:
+            continue
+
+        username = username.lower()
+        if username in seen:
+            continue
+
+        seen.add(username)
+        found.append(username)
+
+    return found
+
+
+def kind_label(chat):
+    """Человекочитаемый тип найденного юзернейма."""
+    chat_type = getattr(chat, 'type', None)
+    name = getattr(chat_type, 'name', str(chat_type)).upper()
+
+    if 'BOT' in name:
+        return 'бот'
+    if 'CHANNEL' in name:
+        return 'канал'
+    if 'GROUP' in name or 'FORUM' in name:
+        return 'группа'
+    if 'PRIVATE' in name:
+        return 'пользователь'
+    return name.lower()
+
+
+def cached_check(username):
+    """Свежий результат из базы, чтобы не спрашивать Telegram дважды."""
+    fresh_after = time.time() - CHECK_CACHE_DAYS * 86400
+    rows = sql_select(
+        f"SELECT username, status, kind, tg_id, name, note FROM username_checks "
+        f"WHERE username = '{username}' AND checked_at > {fresh_after}")
+    if not rows:
+        return None
+    username, status, kind, tg_id, name, note = rows[0]
+    return {'username': username, 'status': status, 'kind': kind or '', 'tg_id': tg_id or '',
+            'name': name or '', 'note': note or '', 'cached': True}
+
+
+def save_check(row):
+    sql_edit(
+        'INSERT OR REPLACE INTO username_checks(username, status, kind, tg_id, name, note, checked_at) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?)',
+        (row['username'], row['status'], row['kind'], row['tg_id'], row['name'], row['note'], time.time()))
+
+
+async def resolve_username(client, username):
+    """Один лёгкий резолв: force_full=False не дёргает GetFullUser и не ловит флуд."""
+    chat = await client.get_chat(username, force_full=False)
+
+    name = getattr(chat, 'title', None)
+    if not name:
+        name = ' '.join(part for part in (getattr(chat, 'first_name', None),
+                                          getattr(chat, 'last_name', None)) if part)
+
+    return {'username': username, 'status': 'occupied', 'kind': kind_label(chat),
+            'tg_id': str(chat.id), 'name': name or '', 'note': '', 'cached': False}
+
+
+async def run_username_check(usernames, on_progress=None):
+    """Проверяем список юзернеймов по очереди. Возвращает (строки, статистика)."""
+    rows = []
+    stats = {'total': len(usernames), 'checked': 0, 'occupied': 0, 'free': 0, 'invalid': 0,
+             'errors': 0, 'cached': 0, 'stopped': None}
+    consecutive = 0
+    turn = 0
+
+    def account(row):
+        rows.append(row)
+        stats['checked'] += 1
+        if row['status'] == 'occupied':
+            stats['occupied'] += 1
+        elif row['status'] == 'free':
+            stats['free'] += 1
+        elif row['status'] == 'invalid':
+            stats['invalid'] += 1
+        else:
+            stats['errors'] += 1
+
+    for username in usernames:
+
+        if not working:
+            stats['stopped'] = 'остановлено командой /finish'
+            break
+
+        # формат проверяем локально: Telegram о таких никах спрашивать незачем
+        if not USERNAME_RE.match(username):
+            account({'username': username, 'status': 'invalid', 'kind': '', 'tg_id': '',
+                     'name': '', 'note': 'недопустимый ник', 'cached': False})
+            continue
+
+        cached = cached_check(username)
+        if cached:
+            account(cached)
+            stats['cached'] += 1
+            continue
+
+        alive = [worker for worker in workers_list.values() if worker.is_connected]
+        if not alive:
+            stats['stopped'] = 'ни один аккаунт не подключён'
+            break
+
+        client = alive[turn % len(alive)]
+        turn += 1
+
+        row = None
+        for attempt in (1, 2):
+            try:
+                row = await resolve_username(client, username)
+                break
+
+            except UsernameNotOccupied:
+                row = {'username': username, 'status': 'free', 'kind': '', 'tg_id': '',
+                       'name': '', 'note': 'ник свободен', 'cached': False}
+                break
+
+            except UsernameInvalid:
+                row = {'username': username, 'status': 'invalid', 'kind': '', 'tg_id': '',
+                       'name': '', 'note': 'недопустимый ник', 'cached': False}
+                break
+
+            except FloodWait as e:
+                print(f'[check] FLOOD_WAIT {e.value} на {username}')
+                await asyncio.sleep(e.value + 2)
+
+            except PeerFlood as e:
+                stats['stopped'] = 'Telegram ограничил аккаунт (PeerFlood) — проверка остановлена'
+                print(f'[check] PeerFlood: {e}')
+                row = None
+                break
+
+            except Exception as e:
+                print(f'[check] {username}: {e}')
+                row = {'username': username, 'status': 'error', 'kind': '', 'tg_id': '',
+                       'name': '', 'note': str(e)[:150], 'cached': False}
+                break
+
+        if stats['stopped']:
+            break
+
+        if row is None:
+            row = {'username': username, 'status': 'error', 'kind': '', 'tg_id': '',
+                   'name': '', 'note': 'не ответил после ожидания флуда', 'cached': False}
+
+        if row['status'] == 'error':
+            consecutive += 1
+            if consecutive >= CHECK_MAX_ERRORS:
+                account(row)
+                stats['stopped'] = f'{consecutive} ошибок подряд — проверка остановлена'
+                break
+        else:
+            consecutive = 0
+            save_check(row)
+
+        account(row)
+
+        if on_progress:
+            await on_progress(stats)
+
+        await asyncio.sleep(CHECK_PAUSE)
+
+    return rows, stats
+
+
+def write_check_csv(rows):
+    """Отчёт в CSV: разделитель ; и BOM, чтобы Excel открывал без настроек."""
+    labels = {'occupied': 'да', 'free': 'нет', 'invalid': 'нет', 'error': '?'}
+    path = os.path.join(BOT_DIR, f'check_{datetime.now().strftime("%Y-%m-%d_%H-%M")}_{len(rows)}.csv')
+
+    with open(path, 'w', encoding='utf-8-sig', newline='') as report:
+        writer = csv.writer(report, delimiter=';')
+        writer.writerow(('nickname', 'exists', 'type', 'id', 'name', 'note'))
+        for row in rows:
+            writer.writerow((row['username'], labels.get(row['status'], '?'), row['kind'],
+                             row['tg_id'], row['name'], row['note']))
+
+    return path
+
+
 def sent_today_count():
     """Счётчик отправленного за сутки с автосбросом в полночь."""
     global SENT_TODAY, SENT_DATE
@@ -150,6 +361,16 @@ WORK_SINCE = 0
 WORK_UNTIL = 0
 MANAGERS_COUNT = 0
 emojies = ('🤝', '👍', '🤔', '💪', '🤓')
+
+# чекер юзернеймов: пауза между запросами и срок годности кеша
+
+CHECK_PAUSE = 2.5
+CHECK_CACHE_DAYS = 30
+CHECK_MAX_ERRORS = 5
+
+# правила Telegram: 5–32 символа, начинается с буквы, заканчивается буквой или цифрой
+
+USERNAME_RE = re.compile(r'^[a-z][a-z0-9_]{3,30}[a-z0-9]$', re.IGNORECASE)
 
 # реакции по умолчанию для автолайков
 
@@ -233,6 +454,7 @@ async def menu(message):
     
     if workers_list:
         keyboard.append([InlineKeyboardButton('Спарсить юзеров в коментах 💬', callback_data='parse_comments')])
+        keyboard.append([InlineKeyboardButton('Чекер аккаунтов 🔎', callback_data='check_usernames')])
         keyboard.append([InlineKeyboardButton('Поиск каналов 🔎', callback_data='search')])
     
     keyboard.append([InlineKeyboardButton('Канал уведомлений 🥰', callback_data='service channel')])
@@ -820,6 +1042,12 @@ def setup_manager(app):
     
     @app.on_message(filters.document)
     async def login(_, document):
+
+        # кто-то ждёт файл (например чекер аккаунтов) — отдаём документ ему
+        if await wants_documents(document.from_user.id):
+            await is_handler(document)
+            return
+
         sent = await document.reply('🌴 Проверяем файл...')
         
         if document.document.file_name.endswith('.session'):
@@ -932,7 +1160,8 @@ def setup_manager(app):
     @app.on_message()
     async def handle(_, message):
         if not await is_handler(message):
-            if message.text.startswith('https://t.me/') or message.text.startswith('t.me/'):
+            if message.text and (message.text.startswith('https://t.me/')
+                                 or message.text.startswith('t.me/')):
                 msg = await message.reply('Получаем посты...')
                 
                 if worker_apps:
@@ -2834,6 +3063,134 @@ def setup_manager(app):
             await add_handler(callback_query.from_user.id, wait)
         
         
+        elif data.startswith('check_usernames'):
+
+            sent = await app.send_message(
+                callback_query.from_user.id,
+                '🔎 <b>Чекер аккаунтов</b>\n\n'
+                'Пришлите список ников — файлом <code>.txt</code>/<code>.csv</code> или сообщением, '
+                'по одному в строке. Подойдут и <code>@ник</code>, и ссылки.\n\n'
+                f'Проверка идёт с паузой {CHECK_PAUSE} сек на ник, чтобы Telegram не ограничил аккаунт. '
+                f'Результаты моложе {CHECK_CACHE_DAYS} дней берутся из базы, так что прерванную проверку '
+                'можно просто запустить заново.',
+                reply_markup=ReplyKeyboardMarkup([['Отмена ❌']], resize_keyboard=True))
+
+            async def wait(message, sent=sent):
+
+                await remove_handler(message.from_user.id)
+                try:
+                    await app.delete_messages(sent.chat.id, sent.id)
+                except Exception:
+                    pass
+
+                if message.text == 'Отмена ❌':
+                    await app.send_message(callback_query.from_user.id, '❌ Отменено',
+                                           reply_markup=MAIN_KEYBOARD)
+                    return
+
+                # список приходит файлом или текстом
+                raw_text = message.text or message.caption or ''
+                if message.document:
+                    try:
+                        downloaded = await app.download_media(
+                            message, file_name=os.path.join(BOT_DIR, 'check_input.txt'))
+                        with open(downloaded, encoding='utf-8', errors='replace') as source:
+                            raw_text = source.read()
+                    except Exception as e:
+                        await app.send_message(callback_query.from_user.id,
+                                               f'😛 Не смог прочитать файл\n\n<pre>{e}</pre>',
+                                               reply_markup=MAIN_KEYBOARD)
+                        return
+
+                usernames = parse_username_list(raw_text)
+
+                if not usernames:
+                    await app.send_message(callback_query.from_user.id,
+                                           '🤷‍♂️ В списке не нашлось ни одного ника',
+                                           reply_markup=MAIN_KEYBOARD)
+                    return
+
+                if not [worker for worker in workers_list.values() if worker.is_connected]:
+                    await app.send_message(callback_query.from_user.id,
+                                           '⛔️ Ни один аккаунт не подключён — проверять нечем',
+                                           reply_markup=MAIN_KEYBOARD)
+                    return
+
+                global working
+                working = True
+
+                known = sum(1 for username in usernames if cached_check(username))
+                to_ask = len(usernames) - known
+                minutes = int(to_ask * CHECK_PAUSE / 60) + 1
+
+                progress = await app.send_message(
+                    callback_query.from_user.id,
+                    f'🔎 Ников в списке: <b>{len(usernames)}</b>\n'
+                    f'Из базы возьму: <b>{known}</b>, спрошу Telegram: <b>{to_ask}</b>\n'
+                    f'Это примерно <b>{minutes} мин</b>\n\n'
+                    f'<i>Остановить досрочно - /finish</i>',
+                    reply_markup=MAIN_KEYBOARD)
+
+                async def finish(finishmessage):
+                    if finishmessage.text == '/finish':
+                        global working
+                        working = False
+
+                await add_handler(callback_query.from_user.id, finish)
+
+                last_edit = [time.time()]
+
+                async def on_progress(stats):
+                    # прогресс правим не чаще раза в 20 секунд, чтобы не ловить лимиты на правки
+                    if time.time() - last_edit[0] < 20:
+                        return
+                    last_edit[0] = time.time()
+                    left = int((stats['total'] - stats['checked']) * CHECK_PAUSE / 60) + 1
+                    try:
+                        await progress.edit(
+                            f'🔎 Проверено <b>{stats["checked"]}</b> из <b>{stats["total"]}</b>\n'
+                            f'Занято: <b>{stats["occupied"]}</b> · свободно: <b>{stats["free"]}</b> · '
+                            f'брак: <b>{stats["invalid"]}</b> · ошибок: <b>{stats["errors"]}</b>\n'
+                            f'Осталось примерно <b>{left} мин</b>\n\n'
+                            f'<i>Остановить досрочно - /finish</i>')
+                    except Exception:
+                        pass
+
+                try:
+                    rows, stats = await run_username_check(usernames, on_progress)
+                finally:
+                    working = False
+                    await remove_handler(callback_query.from_user.id)
+
+                report = write_check_csv(rows)
+                log_event(None, 'check', ok=1 if not stats['stopped'] else 0,
+                          detail=f'проверено {stats["checked"]}/{stats["total"]}, '
+                                 f'занято {stats["occupied"]}' + (f', {stats["stopped"]}' if stats['stopped'] else ''))
+
+                summary = (
+                    f'✅ <b>Проверка закончена</b>\n\n'
+                    f'Ников в списке: <b>{stats["total"]}</b>\n'
+                    f'Проверено: <b>{stats["checked"]}</b> (из базы {stats["cached"]})\n'
+                    f'Занято в Telegram: <b>{stats["occupied"]}</b>\n'
+                    f'Свободно: <b>{stats["free"]}</b>\n'
+                    f'Недопустимых ников: <b>{stats["invalid"]}</b>\n'
+                    f'Ошибок: <b>{stats["errors"]}</b>')
+
+                if stats['stopped']:
+                    summary += (f'\n\n⚠️ {stats["stopped"]}\n'
+                                f'Непроверенное останется в списке — запусти проверку тем же файлом, '
+                                f'уже найденное возьмётся из базы.')
+
+                try:
+                    await progress.edit(summary)
+                except Exception:
+                    await app.send_message(callback_query.from_user.id, summary)
+
+                await app.send_document(callback_query.from_user.id, report,
+                                        caption='📄 Результаты проверки')
+
+            await add_handler(callback_query.from_user.id, wait, accepts_documents=True)
+
         elif data.startswith('parse_comments'):
             
             sent = await app.send_message(
