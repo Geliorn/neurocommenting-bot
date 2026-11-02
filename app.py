@@ -764,7 +764,7 @@ async def _show_autoreply_menu(edit_func, session):
     if not s:
         return
     auto_reply_text, reply_use_ai, reply_role, reply_prompt, reply_max_rounds, reply_delay, enabled = s[0]
-    enabled = 1 if enabled is None else enabled
+    enabled = 0 if enabled is None else enabled
     reply_max_rounds = reply_max_rounds or 3
     reply_delay = reply_delay if reply_delay is not None else 1
     status = '✅ Включены' if enabled else '❌ Выключены'
@@ -1119,13 +1119,13 @@ def setup_manager(app):
                         workers_list[account_info.phone_number] = client
                         
                         if proxy.text != 'Без прокси':
-                            sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                            sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode, auto_reply_enabled) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                                      (account_info.phone_number, proxy.text,
                                       'Вы - двадцатилетняя девушка',
                                       "Отвечу только когда перейдёшь по ссылке в описании)", 0, 1, 1,
                                       'Напиши интересный комментарий до 10 слов на тему этого поста:', 'text'))
                         else:
-                            sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                            sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode, auto_reply_enabled) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                                      (account_info.phone_number, None,
                                       'Вы - двадцатилетняя девушка',
                                       "Отвечу только когда перейдёшь по ссылке в описании)", 0, 1, 1,
@@ -1338,7 +1338,7 @@ def setup_manager(app):
                 channels_count_row = sql_select(f"SELECT COUNT(*) FROM channels WHERE session = '{session}'")
                 channels_count = channels_count_row[0][0] if channels_count_row else 0
 
-                auto_reply_enabled = settings[0][23] if len(settings[0]) > 23 and settings[0][23] is not None else 1
+                auto_reply_enabled = settings[0][23] if len(settings[0]) > 23 and settings[0][23] is not None else 0
                 broadcast_enabled = settings[0][20] if len(settings[0]) > 20 and settings[0][20] is not None else 0
                 dm_enabled = settings[0][10] if len(settings[0]) > 10 and settings[0][10] is not None else 0
 
@@ -3739,13 +3739,13 @@ def setup_manager(app):
                                             setup_worker(client)
                                             
                                             if proxy.text != 'Без прокси':
-                                                sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                                sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode, auto_reply_enabled) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                                                          (phone, proxy.text,
                                                           'Вы - двадцатилетняя девушка',
                                                           "Отвечу только когда перейдёшь по ссылке в описании)", 0, 1, 1,
                                       'Напиши интересный комментарий до 10 слов на тему этого поста:', 'text'))
                                             else:
-                                                sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                                sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode, auto_reply_enabled) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                                                          (phone, None,
                                                           'Вы - двадцатилетняя девушка',
                                                           "Отвечу только когда перейдёшь по ссылке в описании)", 0, 1, 1,
@@ -3775,13 +3775,13 @@ def setup_manager(app):
                                 worker_apps.append(client)
                                 
                                 if proxy.text != 'Без прокси':
-                                    sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                    sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode, auto_reply_enabled) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                                              (phone, proxy.text,
                                               'Вы - двадцатилетняя девушка',
                                               "Отвечу только когда перейдёшь по ссылке в описании)", 0, 1, 1,
                                       'Напиши интересный комментарий до 10 слов на тему этого поста:', 'text'))
                                 else:
-                                    sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                    sql_edit('INSERT INTO workers(session, proxy, prompt, auto_reply, delay, chance, be_first, what_to_write, mode, auto_reply_enabled) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)',
                                              (phone, None,
                                               'Вы - двадцатилетняя девушка',
                                               "Отвечу только когда перейдёшь по ссылке в описании)", 0, 1, 1,
@@ -4311,7 +4311,7 @@ def setup_worker(app):
             await app.send_chat_action(message.chat.id, ChatAction.CANCEL)
             return
 
-        auto_reply_enabled = settings[0][23] if len(settings[0]) > 23 and settings[0][23] is not None else 1
+        auto_reply_enabled = settings[0][23] if len(settings[0]) > 23 and settings[0][23] is not None else 0
         if not auto_reply_enabled:
             await app.send_chat_action(message.chat.id, ChatAction.CANCEL)
             return
