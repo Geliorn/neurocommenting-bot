@@ -185,6 +185,20 @@ echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart com, /usr/bin/system
 
 Страница слушает только `127.0.0.1`, чтение открыто, а действия требуют токен из самой страницы и проверку `Origin` — иначе любой сайт в браузере смог бы послать POST на localhost. Снаружи смотреть — через SSH-туннель: `ssh -L 8787:127.0.0.1:8787 user@host`.
 
+### Ярлык в списке программ
+
+Чтобы не держать в голове адрес, монитор можно открывать как обычное приложение:
+
+```bash
+mkdir -p ~/.local/share/applications ~/.local/share/icons/hicolor/scalable/apps
+cp desktop/combot-monitor.svg ~/.local/share/icons/hicolor/scalable/apps/
+cp desktop/open-monitor.sh /path/to/ComBot/ && chmod +x /path/to/ComBot/open-monitor.sh
+sed 's|/path/to/ComBot|/путь/к/ComBot|' desktop/combot-monitor.desktop > ~/.local/share/applications/combot-monitor.desktop
+update-desktop-database ~/.local/share/applications
+```
+
+После этого в меню приложений появится **ComBot — монитор**. Ярлык не просто открывает адрес: он сначала поднимает службу монитора, если она была остановлена, ждёт, пока страница ответит, и только потом открывает браузер. Порт при необходимости меняется переменной `COMBOT_MONITOR_PORT`.
+
 ### Вотчдог
 
 Раз в минуту проверяет состояние и перезапускает бота, **только если связь есть, а бот её не использует** — то есть не дёргает его, когда проблема в сети. Защита от цикла: не чаще одного перезапуска в 10 минут и максимум 3 подряд, дальше только уведомления.
@@ -383,6 +397,10 @@ ComBot/
 ├── handlers.py             # Механизм ожидания ввода от пользователя
 ├── menus.py                # Меню шаблонов коммента
 ├── sqlite_functions.py     # Работа с базой данных
+├── desktop/
+│   ├── combot-monitor.desktop     # Ярлык монитора для меню приложений
+│   ├── combot-monitor.svg         # Иконка ярлыка
+│   └── open-monitor.sh            # Поднимает монитор и открывает страницу
 ├── systemd/
 │   ├── com.service                # Автозапуск бота
 │   ├── combot-monitor.service     # Веб-страница монитора

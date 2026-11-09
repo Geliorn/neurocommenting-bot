@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ComBot — монитор
+GenericName=Мониторинг Telegram-бота
+Comment=Статус бота, связь с Telegram, текущие операции и статистика
+Exec=/path/to/ComBot/desktop/open-monitor.sh
+Icon=combot-monitor
+Terminal=false
+Categories=Utility;Monitor;
+Keywords=combot;telegram;бот;монитор;статус;monitor;
+StartupNotify=true
