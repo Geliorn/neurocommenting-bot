@@ -42,6 +42,16 @@ NET_TARGETS = (('1.1.1.1', 443), ('8.8.8.8', 53))
 TG_TARGETS = (('149.154.167.51', 443), ('149.154.175.50', 443), ('91.108.56.100', 443))
 TG_HOST = 'api.telegram.org'
 
+JOB_LABELS = {
+    'dm_blast': '\U0001f4e8 рассылка по ЛС',
+    'invite': '\U0001f981 инвайтинг',
+    'parse': '\U0001f4ac парсинг комментариев',
+    'check': '\U0001f50e проверка ников',
+}
+
+# операция считается застрявшей, если не продвинулась столько секунд
+JOB_STUCK_AFTER = 600
+
 KIND_LABELS = {
     'comment': 'комментарии',
     'like': 'лайки',
@@ -51,7 +61,41 @@ KIND_LABELS = {
     'dm_blast': 'рассылки по ЛС',
     'check': 'проверки ников',
     'ai': 'запросы к ИИ',
+    'invite': 'инвайтинг',
+    'crash': 'падения обработчиков',
 }
+
+
+def job_line(job):
+    """Строка об операции: прогресс, темп и оценка остатка."""
+    label = JOB_LABELS.get(job.get('kind'), job.get('kind', 'операция'))
+    done, total = job.get('done', 0), job.get('total', 0)
+    spent = max(time.time() - job.get('started_at', time.time()), 1)
+    rate = done / spent * 60
+
+    text = label
+    if job.get('title'):
+        text += f' · {job["title"]}'
+    if job.get('account'):
+        text += f' · {job["account"]}'
+    text += f' · {done}/{total}' if total else f' · {done}'
+    if job.get('errors'):
+        text += f' · ошибок {job["errors"]}'
+    text += f' · идёт {human_age(spent)}'
+    if rate > 0 and total and done < total:
+        text += f' · {rate:.0f}/мин, осталось ~{human_age((total - done) / rate * 60)}'
+
+    idle = time.time() - job.get('updated_at', job.get('started_at', 0))
+    if idle > JOB_STUCK_AFTER:
+        text += f' · \u26a0\ufe0f не двигается {human_age(idle)}'
+
+    return text
+
+
+def stuck_jobs(state):
+    now = time.time()
+    return [job for job in ((state or {}).get('processes') or {}).get('jobs', [])
+            if now - job.get('updated_at', now) > JOB_STUCK_AFTER]
 
 
 # ---------------------------------------------------------------- состояние бота
@@ -400,6 +444,13 @@ def diagnose(state, state_error, service, probes):
         return {'level': 'warn', 'headline': f'Telegram давно не отвечал на запросы: {names}',
                 'hint': 'Соединение держится, но RPC не проходят — присмотрись.'}
 
+    stuck = stuck_jobs(state)
+    if stuck:
+        names = ', '.join(JOB_LABELS.get(job['kind'], job['kind']) for job in stuck)
+        idle = max(time.time() - job.get('updated_at', 0) for job in stuck)
+        return {'level': 'warn', 'headline': f'Операция не двигается: {names}',
+                'hint': f'Нет продвижения {human_age(idle)}. Останови командой /finish, если это зависание.'}
+
     limited = state.get('limited') or []
     if limited:
         names = ', '.join(item['session'] for item in limited)
@@ -592,18 +643,17 @@ def render_text(data, color=True):
     lines.append('Процессы:')
     lines.append('  рассылка в чаты ' + (', '.join(processes.get('broadcast') or []) or 'не запущена'))
 
-    blasts = processes.get('dm_blasts') or {}
-    if blasts:
-        for session, progress in blasts.items():
-            lines.append(f'  рассылка в ЛС   {session}: {progress.get("sent", 0)} из {progress.get("total", 0)}'
-                         f', ошибок {progress.get("failed", 0)}')
+    jobs = processes.get('jobs') or []
+    if jobs:
+        for job in jobs:
+            idle = time.time() - job.get('updated_at', time.time())
+            lines.append('  ' + paint(job_line(job), 'warn' if idle > JOB_STUCK_AFTER else 'ok', color))
     else:
-        lines.append('  рассылка в ЛС   не запущена')
+        lines.append('  операций        нет')
 
     for item in (state.get('limited') or []):
         lines.append('  ' + paint(f'\u26d4 {item["session"]}: {item.get("reason") or "ограничен Telegram"}',
                                   'warn', color))
-    lines.append('  парсинг         ' + ('идёт' if processes.get('parsing') else 'не идёт'))
     lines.append(f'  задач           {processes.get("tasks", "?")}')
 
     lines.append('')
@@ -888,11 +938,34 @@ async function render() {
   cards.push(net + '</div>');
 
   const p = st.processes || {};
-  cards.push('<div class="card"><h2>Процессы</h2>'
-    + row('рассылка', esc((p.broadcast || []).join(', ') || 'не запущена'))
-    + row('парсинг', p.parsing ? 'идёт' : 'не идёт')
-    + row('задач', esc(p.tasks === undefined ? '—' : p.tasks))
-    + row('клиентов', esc((st.managers || []).length + (st.workers || []).length)) + '</div>');
+  const JOBS = {dm_blast:'📨 рассылка по ЛС', invite:'🦁 инвайтинг',
+                parse:'💬 парсинг комментариев', check:'🔎 проверка ников'};
+  let proc = '<div class="card"><h2>Операции</h2>';
+  const jobs = p.jobs || [];
+  if (!jobs.length) proc += '<div class="dim">сейчас ничего не выполняется</div>';
+  jobs.forEach(j => {
+    const spent = Math.max(d.ts - (j.started_at || d.ts), 1);
+    const idle = d.ts - (j.updated_at || j.started_at || d.ts);
+    const rate = (j.done || 0) / spent * 60;
+    const pct = j.total ? Math.round((j.done || 0) / j.total * 100) : 0;
+    proc += '<div class="row"><span>' + esc(JOBS[j.kind] || j.kind)
+      + (j.title ? ' <span class="dim">· ' + esc(j.title) + '</span>' : '')
+      + '</span><span>' + (j.done || 0) + (j.total ? '/' + j.total : '') + '</span></div>'
+      + '<div class="bars" style="height:8px"><i style="flex:' + Math.max(pct, 1)
+      + '" ></i><i style="flex:' + Math.max(100 - pct, 1) + ';background:var(--line)"></i></div>'
+      + '<div class="f">идёт ' + age(spent) + (j.errors ? ' · ошибок ' + j.errors : '')
+      + (rate > 0 && j.total && j.done < j.total
+          ? ' · ' + rate.toFixed(0) + '/мин · осталось ~' + age((j.total - j.done) / rate * 60) : '')
+      + (idle > 600 ? ' · <span class="warn">⚠️ не двигается ' + age(idle) + '</span>' : '')
+      + '</div>';
+  });
+  proc += row('рассылка в чаты', esc((p.broadcast || []).join(', ') || 'не запущена'))
+    + row('задач в цикле', esc(p.tasks === undefined ? '—' : p.tasks))
+    + row('клиентов', esc((st.managers || []).length + (st.workers || []).length));
+  (st.limited || []).forEach(l => {
+    proc += '<div class="f"><span class="down">⛔️ ' + esc(l.session) + '</span> — ' + esc(l.reason) + '</div>';
+  });
+  cards.push(proc + '</div>');
 
   let acc = '<div class="card"><h2>Аккаунты</h2><table>';
   (d.accounts || []).forEach(a => {

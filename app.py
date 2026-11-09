@@ -60,9 +60,61 @@ STARTED_AT = time.time()
 
 running_broadcasts = set()
 
-# активные рассылки по ЛС: сессия → состояние, чтобы не запускать две и уметь останавливать
+# долгие операции (рассылки, инвайтинг, парсинг, проверка ников): id → состояние.
+# Через реестр они видны в мониторе и останавливаются командой /finish.
 
-running_dm_blasts = {}
+running_jobs = {}
+
+JOB_LABELS = {
+    'dm_blast': '\U0001f4e8 рассылка по ЛС',
+    'invite': '\U0001f981 инвайтинг',
+    'parse': '\U0001f4ac парсинг комментариев',
+    'check': '\U0001f50e проверка ников',
+}
+
+
+def start_job(kind, account=None, total=0, title=''):
+    """Регистрируем операцию: с этого момента её видно в мониторе."""
+    job = {
+        'id': f'{kind}:{account or "-"}:{int(time.time() * 1000) % 1000000}',
+        'kind': kind, 'account': account, 'title': title,
+        'total': total, 'done': 0, 'errors': 0,
+        'started_at': time.time(), 'updated_at': time.time(), 'stop': False,
+    }
+    running_jobs[job['id']] = job
+    return job
+
+
+def job_tick(job, done=None, errors=None, total=None):
+    """Отмечаем продвижение: по updated_at монитор понимает, что операция не встала."""
+    if done is not None:
+        job['done'] = done
+    if errors is not None:
+        job['errors'] = errors
+    if total is not None:
+        job['total'] = total
+    job['updated_at'] = time.time()
+
+
+def finish_job(job):
+    running_jobs.pop(job.get('id'), None)
+
+
+def stop_jobs(kind=None, account=None):
+    """Просим операции остановиться — циклы проверяют флаг на каждом шаге."""
+    asked = 0
+    for job in running_jobs.values():
+        if kind and job['kind'] != kind:
+            continue
+        if account and job['account'] != account:
+            continue
+        job['stop'] = True
+        asked += 1
+    return asked
+
+
+def job_running(kind, account):
+    return any(job['kind'] == kind and job['account'] == account for job in running_jobs.values())
 
 # как часто проверяем живой RPC у каждого клиента: GetFullUser дорогой и ловит FLOOD_WAIT
 
@@ -248,7 +300,7 @@ async def resolve_username(client, username):
             'tg_id': str(chat.id), 'name': name or '', 'note': '', 'cached': False}
 
 
-async def run_username_check(usernames, on_progress=None):
+async def run_username_check(usernames, job, on_progress=None):
     """Проверяем список юзернеймов по очереди. Возвращает (строки, статистика)."""
     rows = []
     stats = {'total': len(usernames), 'checked': 0, 'occupied': 0, 'free': 0, 'invalid': 0,
@@ -270,7 +322,7 @@ async def run_username_check(usernames, on_progress=None):
 
     for username in usernames:
 
-        if not working:
+        if job['stop']:
             stats['stopped'] = 'остановлено командой /finish'
             break
 
@@ -344,6 +396,7 @@ async def run_username_check(usernames, on_progress=None):
             save_check(row)
 
         account(row)
+        job_tick(job, done=stats['checked'], errors=stats['errors'])
 
         if on_progress:
             await on_progress(stats)
@@ -1808,61 +1861,100 @@ def setup_manager(app):
 
                             return secs
 
+                        if job_running('invite', client_data.phone_number):
+                            await callback_query.message.reply(
+                                '⚠️ С этого аккаунта уже идёт инвайтинг',
+                                reply_markup=MAIN_KEYBOARD)
+                            return
+
+                        limit = account_limit(client_data.phone_number)
+                        if limit:
+                            await callback_query.message.reply(
+                                f'⛔️ Аккаунт ограничен Telegram: {limit["reason"]}. Проверь @spambot',
+                                reply_markup=MAIN_KEYBOARD)
+                            return
+
                         res_msg = await callback_query.message.reply('Запустили инвайтинг!',
                                                                      reply_markup=MAIN_KEYBOARD)
 
-                        total = 0
+                        people = [line for line in people_list.text.split('\n') if line.strip()]
                         successes = 0
                         failures = 0
+                        consecutive = 0
+                        last_error_report = 0
+                        stopped = None
 
-                        users_to_add = []
+                        job = start_job('invite', account=client_data.phone_number,
+                                        total=len(people), title=group.title)
 
-                        for person in people_list.text.split('\n'):
+                        for number, raw_person in enumerate(people, 1):
 
-                            total += 1
+                            if job['stop']:
+                                stopped = 'остановлено командой /finish'
+                                break
 
-                            if person.startswith('https://t.me/'):
-                                person = person[13:]
-                            elif person.startswith('t.me/'):
-                                person = person[5:]
-                            elif person.startswith('@'):
-                                person = person[1:]
-                            elif person.isdigit():
-                                person = int(person)
-
-                            users_to_add.append(person)
+                            person = normalize_chat_link(raw_person)
 
                             try:
-                                await client.add_chat_members(group.id, users_to_add)
+                                # добавляем по одному: раньше список рос и всех предыдущих звали заново
+                                await client.add_chat_members(group.id, person)
                                 successes += 1
-                            except Exception as e:
-                                await app.send_message(channel_text.from_user.id, f'Ошибка:\n\n<pre>{e}</pre>')
-                                failures += 1
+                                consecutive = 0
 
+                            except PeerFlood as e:
+                                mark_limited(client_data.phone_number, 'PEER_FLOOD при инвайтинге')
+                                stopped = 'Telegram ограничил аккаунт (PEER_FLOOD). Проверь @spambot'
+                                print(f'[invite] PeerFlood: {e}')
+                                break
+
+                            except FloodWait as e:
+                                print(f'[invite] FLOOD_WAIT {e.value}')
+                                await asyncio.sleep(e.value + 2)
+                                continue
+
+                            except Exception as e:
+                                failures += 1
+                                consecutive += 1
+
+                                # об ошибках не чаще раза в минуту: раньше шло сообщение на каждого
+                                if time.time() - last_error_report > 60:
+                                    last_error_report = time.time()
+                                    await app.send_message(
+                                        channel_text.from_user.id,
+                                        f'🦁 Инвайтинг: ошибок {failures}, '
+                                        f'последняя на {raw_person.strip()}\n\n<pre>{e}</pre>')
+
+                                if consecutive >= 10:
+                                    stopped = f'{consecutive} ошибок подряд — похоже, аккаунт ограничен'
+                                    break
+
+                            job_tick(job, done=number, errors=failures)
                             await asyncio.sleep(await count_cooldown())
 
+                        finish_job(job)
 
+                        summary = (f'🦁 <b>Инвайтинг завершён</b> — {client_data.first_name}\n\n'
+                                   f'Группа: {group.title}\n'
+                                   f'Людей в списке: <b>{len(people)}</b>\n'
+                                   f'Добавлено: <b>{successes}</b>\n'
+                                   f'Ошибок: <b>{failures}</b>')
+                        if stopped:
+                            summary += f'\n\n⚠️ {stopped}'
 
-                        await app.send_message(
-                            people_list.from_user.id,
-                            f'Рассылка с аккаунта {client_data.mention}:\n\n'
-                            f'{total}/{len(people_list.text.split(chr(10)))}\n\n'
-                            f'Отправлено {successes}\n'
-                            f'Ошибок {failures}')
+                        await app.send_message(people_list.from_user.id, summary,
+                                               reply_markup=MAIN_KEYBOARD)
 
-                        service_channel = sql_select('SELECT channel FROM managers')
-                        if service_channel:
-                            try:
-                                await app.send_message(
-                                    service_channel[0][0],
-                                    f'📨 <b>Рассылка в ЛС завершена</b>\n\n'
-                                    f'Аккаунт: {client_data.first_name}\n'
-                                    f'Отправлено: {successes}\n'
-                                    f'Ошибок: {failures}')
-                            except Exception:
-                                pass
+                        log_event(client_data.phone_number, 'invite', group.id, group.title,
+                                  ok=0 if stopped else 1,
+                                  detail=f'добавлено {successes}, ошибок {failures}')
 
-                    await add_handler(callback_query.from_user.id, wait3)
+                        await notify(summary)
+
+                    async def wait3_in_background(message):
+                        # инвайтинг долгий: держать на нём слот диспетчера нельзя
+                        asyncio.create_task(wait3(message))
+
+                    await add_handler(callback_query.from_user.id, wait3_in_background)
 
                 await add_handler(callback_query.from_user.id, wait2)
 
@@ -1924,7 +2016,7 @@ def setup_manager(app):
                                 reply_markup=MAIN_KEYBOARD)
                             return
 
-                        if session in running_dm_blasts:
+                        if job_running('dm_blast', session):
                             await callback_query.message.reply(
                                 '⚠️ С этого аккаунта уже идёт рассылка. Дождись её окончания или '
                                 'останови командой /finish', reply_markup=MAIN_KEYBOARD)
@@ -1947,9 +2039,8 @@ def setup_manager(app):
 
                         async def finish(finishmessage):
                             if finishmessage.text == '/finish':
-                                for running in running_dm_blasts.values():
-                                    running['stop'] = True
-                                await finishmessage.reply('⏹ Останавливаю рассылки...')
+                                asked = stop_jobs()
+                                await finishmessage.reply(f'⏹ Останавливаю операции: {asked}')
 
                         await add_handler(callback_query.from_user.id, finish)
 
@@ -3198,8 +3289,11 @@ def setup_manager(app):
                                            reply_markup=MAIN_KEYBOARD)
                     return
 
-                global working
-                working = True
+                if job_running('check', None):
+                    await app.send_message(callback_query.from_user.id,
+                                           '⚠️ Проверка ников уже идёт. Останови её командой /finish',
+                                           reply_markup=MAIN_KEYBOARD)
+                    return
 
                 known = sum(1 for username in usernames if cached_check(username))
                 to_ask = len(usernames) - known
@@ -3215,8 +3309,8 @@ def setup_manager(app):
 
                 async def finish(finishmessage):
                     if finishmessage.text == '/finish':
-                        global working
-                        working = False
+                        asked = stop_jobs()
+                        await finishmessage.reply(f'⏹ Останавливаю операции: {asked}')
 
                 await add_handler(callback_query.from_user.id, finish)
 
@@ -3238,10 +3332,12 @@ def setup_manager(app):
                     except Exception:
                         pass
 
+                job = start_job('check', total=len(usernames), title=f'{len(usernames)} ников')
+
                 try:
-                    rows, stats = await run_username_check(usernames, on_progress)
+                    rows, stats = await run_username_check(usernames, job, on_progress)
                 finally:
-                    working = False
+                    finish_job(job)
                     await remove_handler(callback_query.from_user.id)
 
                 report = write_check_csv(rows)
@@ -3271,7 +3367,11 @@ def setup_manager(app):
                 await app.send_document(callback_query.from_user.id, report,
                                         caption='📄 Результаты проверки')
 
-            await add_handler(callback_query.from_user.id, wait, accepts_documents=True)
+            async def wait_in_background(message):
+                # долгая работа не должна занимать рабочий слот диспетчера
+                asyncio.create_task(wait(message))
+
+            await add_handler(callback_query.from_user.id, wait_in_background, accepts_documents=True)
 
         elif data.startswith('parse_comments'):
             
@@ -3320,10 +3420,14 @@ def setup_manager(app):
                             f'Найдено {len(msgs)} постов, начинаю парсить комментарии\n\n'
                             f'<i>Завершить парсинг досрочно - /finish</i>')
 
+                        job = start_job('parse', total=len(msgs), title=str(chat_id))
+
                         async def finish(finishmessage):
                             if finishmessage.text == '/finish':
                                 global working
                                 working = False
+                                asked = stop_jobs()
+                                await finishmessage.reply(f'⏹ Останавливаю операции: {asked}')
 
                         await add_handler(callback_query.from_user.id, finish)
 
@@ -3333,9 +3437,9 @@ def setup_manager(app):
                         last_progress = 0
                         last_error_report = 0
 
-                        for message_id in msgs:
+                        for number, message_id in enumerate(msgs, 1):
 
-                            if not working:
+                            if not working or job['stop']:
                                 break
 
                             # берём только живые аккаунты: с отвалившимся парсить нечем
@@ -3397,8 +3501,11 @@ def setup_manager(app):
                                 continue
 
                             consecutive = 0
+                            job_tick(job, done=number, errors=errors)
                             await asyncio.sleep(0.2)
 
+                        finish_job(job)
+                        working = False
                         await remove_handler(callback_query.from_user.id)
 
                         sorted_users = sorted(user_counts.items(), key=lambda x: x[1]['count'], reverse=True)
@@ -3428,8 +3535,12 @@ def setup_manager(app):
                 
                 except Exception as e:
                     await callback_query.message.reply(f'😛 {e}')
-            
-            await add_handler(callback_query.from_user.id, wait)
+
+            async def wait_in_background(message):
+                # парсинг долгий: держать на нём слот диспетчера нельзя
+                asyncio.create_task(wait(message))
+
+            await add_handler(callback_query.from_user.id, wait_in_background)
         
         elif data == 'service channel':
             
@@ -4044,9 +4155,9 @@ async def prepare_blast_message(manager, client, source_message, report):
 
 async def dm_blast(manager, client, session, source_message, recipients, cooldown, reply_to):
     """Рассылка по ЛС отдельной задачей: с прогрессом, остановкой и реакцией на лимиты."""
-    state = {'stop': False, 'sent': 0, 'failed': 0, 'total': len(recipients)}
-    running_dm_blasts[session] = state
     account_name = client.me.first_name if client.me else session
+    job = start_job('dm_blast', account=session, total=len(recipients), title=account_name)
+    state = {'sent': 0, 'failed': 0}
 
     async def report(text):
         try:
@@ -4082,7 +4193,7 @@ async def dm_blast(manager, client, session, source_message, recipients, cooldow
 
         for number, raw_person in enumerate(recipients, 1):
 
-            if state['stop']:
+            if job['stop']:
                 stopped = 'остановлено командой /finish'
                 break
 
@@ -4135,6 +4246,8 @@ async def dm_blast(manager, client, session, source_message, recipients, cooldow
                     stopped = f'{consecutive} ошибок подряд — похоже, аккаунт ограничен'
                     break
 
+            job_tick(job, done=number, errors=state['failed'])
+
             if progress and time.time() - last_edit > 20:
                 last_edit = time.time()
                 try:
@@ -4179,7 +4292,7 @@ async def dm_blast(manager, client, session, source_message, recipients, cooldow
         await report(f'⛔️ Рассылка прервана ошибкой\n\n<pre>{e}</pre>')
 
     finally:
-        running_dm_blasts.pop(session, None)
+        finish_job(job)
 
 
 def setup_worker(app):
@@ -4785,8 +4898,8 @@ async def collect_state():
 
     state['processes'] = {
         'broadcast': sorted(running_broadcasts),
-        'dm_blasts': {session: dict(progress) for session, progress in running_dm_blasts.items()},
-        'parsing': bool(working),
+        'jobs': [dict(job) for job in running_jobs.values()],
+        'parsing': any(job['kind'] == 'parse' for job in running_jobs.values()),
         'tasks': len(asyncio.all_tasks()),
     }
 
