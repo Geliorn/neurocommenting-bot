@@ -872,7 +872,7 @@ def watchdog(restart_enabled=True, cooldown=600, max_streak=3):
 
 # ------------------------------------------------------------------ веб-страница
 
-PAGE = """<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ComBot — монитор</title>
@@ -986,8 +986,8 @@ async function render() {
       + (j.title ? ' <span class="dim">· ' + esc(j.title) + '</span>' : '')
       + '</span><span>' + (j.done || 0) + (j.total ? '/' + j.total : '')
       + (asked ? ' <span class="warn">⏹ останавливается</span>'
-               : ' <button class="danger" style="padding:2px 8px;font-size:12px" onclick="stopJob(\''
-                 + esc(j.id) + '\')">Стоп</button>') + '</span></div>'
+               : ` <button class="danger" style="padding:2px 8px;font-size:12px"`
+                 + ` onclick="stopJob('${esc(j.id)}')">Стоп</button>`) + '</span></div>'
       + '<div class="bars" style="height:8px"><i style="flex:' + Math.max(pct, 1)
       + '" ></i><i style="flex:' + Math.max(100 - pct, 1) + ';background:var(--line)"></i></div>'
       + '<div class="f">идёт ' + age(spent) + (j.errors ? ' · ошибок ' + j.errors : '')
@@ -998,8 +998,8 @@ async function render() {
   });
   if (jobs.length > 1) {
     proc += '<div class="row"><span class="dim">все операции</span><span>'
-      + '<button class="danger" style="padding:2px 8px;font-size:12px" '
-      + 'onclick="stopJob(\'all\')">Остановить все</button></span></div>';
+      + `<button class="danger" style="padding:2px 8px;font-size:12px"`
+      + ` onclick="stopJob('all')">Остановить все</button></span></div>`;
   }
   proc += row('рассылка в чаты', esc((p.broadcast || []).join(', ') || 'не запущена'))
     + row('задач в цикле', esc(p.tasks === undefined ? '—' : p.tasks))
@@ -1074,7 +1074,7 @@ async function loadLogs() {
   box.textContent = 'читаю…';
   try {
     const j = await (await fetch('/api/logs')).json();
-    box.textContent = (j.lines || []).join('\\n');
+    box.textContent = (j.lines || []).join('\n');
     box.scrollTop = box.scrollHeight;
   } catch (e) { box.textContent = String(e); }
 }
