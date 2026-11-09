@@ -47,7 +47,9 @@ KIND_LABELS = {
     'like': 'лайки',
     'reply': 'автоответы',
     'dm': 'аутрич DM',
-    'broadcast': 'рассылка',
+    'broadcast': 'рассылка в чаты',
+    'dm_blast': 'рассылки по ЛС',
+    'check': 'проверки ников',
     'ai': 'запросы к ИИ',
 }
 
@@ -390,12 +392,19 @@ def diagnose(state, state_error, service, probes):
         return {'level': 'warn', 'headline': f'Клиент не подключён: {names}',
                 'hint': 'Связь есть, значит поможет перезапуск.'}
 
+    rpc_interval = state.get('rpc_interval', 300)
     slow = [c for c in clients
-            if c.get('last_rpc_ok') and time.time() - c['last_rpc_ok'] > max(state.get('interval', 30) * 3, 120)]
+            if c.get('last_rpc_ok') and time.time() - c['last_rpc_ok'] > max(rpc_interval * 3, 900)]
     if slow:
         names = ', '.join(c.get('session') or c.get('name') for c in slow)
         return {'level': 'warn', 'headline': f'Telegram давно не отвечал на запросы: {names}',
                 'hint': 'Соединение держится, но RPC не проходят — присмотрись.'}
+
+    limited = state.get('limited') or []
+    if limited:
+        names = ', '.join(item['session'] for item in limited)
+        return {'level': 'warn', 'headline': f'Telegram ограничил аккаунты: {names}',
+                'hint': 'Рассылки с них выключены. Проверь @spambot, отметка снимается через сутки или кнопкой.'}
 
     if not tg_direct and proxy_ok:
         return {'level': 'ok', 'headline': 'Всё работает — через прокси',
@@ -581,7 +590,19 @@ def render_text(data, color=True):
     processes = state.get('processes') or {}
     lines.append('')
     lines.append('Процессы:')
-    lines.append('  рассылка        ' + (', '.join(processes.get('broadcast') or []) or 'не запущена'))
+    lines.append('  рассылка в чаты ' + (', '.join(processes.get('broadcast') or []) or 'не запущена'))
+
+    blasts = processes.get('dm_blasts') or {}
+    if blasts:
+        for session, progress in blasts.items():
+            lines.append(f'  рассылка в ЛС   {session}: {progress.get("sent", 0)} из {progress.get("total", 0)}'
+                         f', ошибок {progress.get("failed", 0)}')
+    else:
+        lines.append('  рассылка в ЛС   не запущена')
+
+    for item in (state.get('limited') or []):
+        lines.append('  ' + paint(f'\u26d4 {item["session"]}: {item.get("reason") or "ограничен Telegram"}',
+                                  'warn', color))
     lines.append('  парсинг         ' + ('идёт' if processes.get('parsing') else 'не идёт'))
     lines.append(f'  задач           {processes.get("tasks", "?")}')
 

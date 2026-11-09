@@ -59,6 +59,10 @@ with sqlite3.connect("database.db") as connection:
         'ALTER TABLE managers ADD COLUMN ai_token TEXT',
         'ALTER TABLE managers ADD COLUMN ai_model TEXT',
 
+        # аккаунты, которых Telegram ограничил (PEER_FLOOD и подобное)
+        'CREATE TABLE IF NOT EXISTS account_limits'
+        '(session TEXT PRIMARY KEY, reason TEXT, noticed_at REAL)',
+
         # результаты проверки юзернеймов: кеш и устойчивость к перезапуску
         'CREATE TABLE IF NOT EXISTS username_checks'
         '(username TEXT PRIMARY KEY, status TEXT NOT NULL, kind TEXT, tg_id TEXT, '

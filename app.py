@@ -9,12 +9,14 @@ import time
 import requests
 import xlsxwriter
 from datetime import date, datetime, timezone, timedelta
+from types import SimpleNamespace
 
 from pyrogram import Client, filters, idle
 from pyrogram.utils import get_event_loop
 from pyrogram.errors import FloodWait, UserDeactivatedBan, AuthKeyDuplicated, AuthKeyUnregistered, Forbidden, UserAlreadyParticipant
 from pyrogram.errors.exceptions.bad_request_400 import (MsgIdInvalid, PeerIdInvalid, ReactionInvalid,
-                                                        UsernameNotOccupied, UsernameInvalid, PeerFlood)
+                                                        UsernameNotOccupied, UsernameInvalid, PeerFlood,
+                                                        YouBlockedUser)
 
 
 from pyrogram.enums import ParseMode, ChatAction
@@ -58,6 +60,14 @@ STARTED_AT = time.time()
 
 running_broadcasts = set()
 
+# активные рассылки по ЛС: сессия → состояние, чтобы не запускать две и уметь останавливать
+
+running_dm_blasts = {}
+
+# как часто проверяем живой RPC у каждого клиента: GetFullUser дорогой и ловит FLOOD_WAIT
+
+RPC_PROBE_INTERVAL = 300
+
 AI_API_BASE = AI_BASE_URL
 
 # таймаут запроса к ИИ: (на соединение, на ответ) — без него зависший провайдер держал бы бота вечно
@@ -73,6 +83,35 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup([['Мои аккаунты 🙂'], ['Мен�
 # костыль для остановки парсинга, потом перепишу
 
 working = False
+
+
+# сколько держим отметку об ограничении, прежде чем разрешить пробовать снова
+
+LIMIT_COOLDOWN = 24 * 3600
+
+
+def mark_limited(session, reason):
+    """Запоминаем, что Telegram ограничил аккаунт: дальше его не дёргаем рассылками."""
+    sql_edit('INSERT OR REPLACE INTO account_limits(session, reason, noticed_at) VALUES(?, ?, ?)',
+             (str(session), str(reason)[:300], time.time()))
+
+
+def account_limit(session):
+    """Активная отметка об ограничении или None, если её нет или она протухла."""
+    rows = sql_select(f"SELECT reason, noticed_at FROM account_limits WHERE session = '{session}'")
+    if not rows:
+        return None
+
+    reason, noticed_at = rows[0]
+    if time.time() - (noticed_at or 0) > LIMIT_COOLDOWN:
+        return None
+
+    return {'reason': reason or 'ограничен Telegram', 'noticed_at': noticed_at or 0,
+            'ago': time.time() - (noticed_at or 0)}
+
+
+def clear_limit(session):
+    sql_edit('DELETE FROM account_limits WHERE session = ?', (str(session),))
 
 
 def normalize_chat_link(text):
@@ -1347,6 +1386,13 @@ def setup_manager(app):
                 like_chats_row = sql_select(f"SELECT COUNT(*) FROM like_chats WHERE session = '{session}'")
                 like_chats_count = like_chats_row[0][0] if like_chats_row else 0
 
+                limit = account_limit(session)
+                limit_line = ''
+                if limit:
+                    hours = int(limit['ago'] // 3600)
+                    limit_line = (f'\n⛔️ <b>Ограничен Telegram</b>: {limit["reason"]}, '
+                                  f'{hours} ч назад. Проверь @spambot\n')
+
                 reply_text = (
                     f'<b>{client_data.first_name}</b> @{client_data.username}:\n\n'
                     f'⭐ Премиум: {client_data.is_premium}\n'
@@ -1355,13 +1401,17 @@ def setup_manager(app):
                     f'👍 Автолайки: {"✅" if likes_enabled else "❌"} ({like_chats_count} чатов)\n'
                     f'💬 Автоответы: {"✅" if auto_reply_enabled else "❌"}\n'
                     f'📢 Рассылка в чаты: {"✅" if broadcast_enabled else "❌"}\n'
-                    f'📨 Аутрич в ЛС: {"✅" if dm_enabled else "❌"}')
+                    f'📨 Аутрич в ЛС: {"✅" if dm_enabled else "❌"}\n'
+                    f'{limit_line}')
 
                 keyboard.append([InlineKeyboardButton('Профиль ⛓️', url=f'tg://user?id={client_data.id}'),
                                  InlineKeyboardButton('✏️', callback_data=f'change {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Изменить proxy 🌐', callback_data=f'set_worker_proxy {client_data.phone_number}'),
                                  InlineKeyboardButton('Удалить аккаунт ❌', callback_data=f'del {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Нейрокомментинг ⚙️', callback_data=f'neurocommenting {client_data.phone_number}')])
+                if limit:
+                    keyboard.append([InlineKeyboardButton('Снять отметку об ограничении ♻️',
+                                                          callback_data=f'clearlimit {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Автолайки 👍', callback_data=f'autolikes {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Автоответы 💬', callback_data=f'autoreply_menu {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Аутрич в ЛС 📨', callback_data=f'outreach {client_data.phone_number}')])
@@ -1807,7 +1857,9 @@ def setup_manager(app):
                     async def wait3(timeout):
 
                         if timeout.text == 'Отмена ❌':
-                            await app.send_message(timeout.from_user.id, '❌ Отменено', reply_markup=MAIN_KEYBOARD)
+                            await remove_handler(people_list.from_user.id)
+                            await app.send_message(timeout.from_user.id, '❌ Отменено',
+                                                   reply_markup=MAIN_KEYBOARD)
                             return
 
                         spl = timeout.text.split('-')
@@ -1824,69 +1876,57 @@ def setup_manager(app):
                             return secs
 
                         await remove_handler(people_list.from_user.id)
-                        await app.delete_messages(people_list.from_user.id, timeout.id)
+                        try:
+                            await app.delete_messages(people_list.from_user.id, timeout.id)
+                        except Exception:
+                            pass
 
-                        client = workers_list[data.split()[1]]
-                        client_data = await client.get_me()
+                        session = data.split()[1]
+                        client = workers_list.get(session)
 
+                        if client is None or not client.is_connected:
+                            await callback_query.message.reply(
+                                '⛔️ Аккаунт не подключён — рассылка не запущена',
+                                reply_markup=MAIN_KEYBOARD)
+                            return
 
-                        await client.send_message(BOT_LINK, random.choice(emojies))
-                        await app.copy_message(client_data.id, message.chat.id, message.id)
+                        if session in running_dm_blasts:
+                            await callback_query.message.reply(
+                                '⚠️ С этого аккаунта уже идёт рассылка. Дождись её окончания или '
+                                'останови командой /finish', reply_markup=MAIN_KEYBOARD)
+                            return
 
-                        msg = None
-                        async for iMsg in client.get_chat_history(BOT_ID, limit=1, offset_id=-1):
-                            msg = iMsg
+                        limit = account_limit(session)
+                        if limit:
+                            await callback_query.message.reply(
+                                f'⛔️ <b>Аккаунт ограничен Telegram</b>\n\n'
+                                f'{limit["reason"]}, отмечено {int(limit["ago"] // 3600)} ч назад.\n'
+                                f'Проверь @spambot. Снять отметку вручную: кнопка в карточке аккаунта.',
+                                reply_markup=MAIN_KEYBOARD)
+                            return
 
-                        total = 0
-                        successes = 0
-                        failures = 0
+                        recipients = [line for line in (people_list.text or '').split('\n') if line.strip()]
+                        if not recipients:
+                            await callback_query.message.reply('🤷‍♂️ В списке нет получателей',
+                                                               reply_markup=MAIN_KEYBOARD)
+                            return
+
+                        async def finish(finishmessage):
+                            if finishmessage.text == '/finish':
+                                for running in running_dm_blasts.values():
+                                    running['stop'] = True
+                                await finishmessage.reply('⏹ Останавливаю рассылки...')
+
+                        await add_handler(callback_query.from_user.id, finish)
 
                         await callback_query.message.reply(
                             'Запустили рассылку!',
                             reply_markup=ReplyKeyboardMarkup([['Мои аккаунты 🙂'], ['Меню 🌴']],
                                                              resize_keyboard=True))
 
-                        for person in people_list.text.split('\n'):
-
-                            total += 1
-
-                            if person.startswith('https://t.me/'):
-                                person = person[13:]
-                            elif person.startswith('t.me/'):
-                                person = person[5:]
-                            elif person.startswith('@'):
-                                person = person[1:]
-                            if person.isdigit():
-                                person = int(person)
-
-                            try:
-
-                                await client.copy_message(person, BOT_ID, msg.id)
-                                successes += 1
-                            except Exception as e:
-                                failures += 1
-                                await message.reply(f'Ошибка при отправке сообщения @{person}:\n\n<pre>{e}</pre>')
-
-                            await asyncio.sleep(await count_cooldown())
-
-                        await app.send_message(
-                            people_list.from_user.id,
-                            f'Рассылка с аккаунта {client_data.mention}:\n\n'
-                            f'{total}/{len(people_list.text.split(chr(10)))}\n\n'
-                            f'Отправлено {successes}\n'
-                            f'Ошибок {failures}')
-
-                        service_channel = sql_select('SELECT channel FROM managers')
-                        if service_channel:
-                            try:
-                                await app.send_message(
-                                    service_channel[0][0],
-                                    f'👥 <b>Инвайтинг завершён</b>\n\n'
-                                    f'Аккаунт: {client_data.first_name}\n'
-                                    f'Добавлено: {successes}\n'
-                                    f'Ошибок: {failures}')
-                            except Exception:
-                                pass
+                        # долгая работа уходит в отдельную задачу: иначе она занимает слот диспетчера
+                        asyncio.create_task(dm_blast(app, client, session, message, recipients,
+                                                     count_cooldown, callback_query.message))
 
                     await add_handler(callback_query.from_user.id, wait3)
 
@@ -2543,6 +2583,14 @@ def setup_manager(app):
                 [InlineKeyboardButton('Назад к аккаунту ◀️', callback_data=f'user {session}')],
             ]
             await callback_query.message.edit(text, reply_markup=InlineKeyboardMarkup(kb))
+
+        elif data.startswith('clearlimit '):
+
+            session = data.split()[1]
+            clear_limit(session)
+            await callback_query.answer('Отметка снята')
+            callback_query.data = f'user {session}'
+            data = callback_query.data
 
         elif data.startswith('autolikes ') and len(data.split()) == 2:
 
@@ -3838,6 +3886,10 @@ async def broadcast_loop(app):
                 await asyncio.sleep(60)
                 continue
 
+            if account_limit(phone):
+                await asyncio.sleep(300)
+                continue
+
             broadcast_text = settings[0][21]
             interval_raw = settings[0][22] or '600-1500'
 
@@ -3873,6 +3925,17 @@ async def broadcast_loop(app):
                         f'Аккаунт: {client_data.first_name}\n'
                         f'Чат: {chat_title}\n'
                         f'Текст: {s[0][21][:300]}')
+                except PeerFlood as e:
+                    mark_limited(phone, 'PEER_FLOOD при рассылке в чаты')
+                    sql_edit('UPDATE workers SET broadcast_enabled = 0 WHERE session = ?', (phone,))
+                    log_event(phone, 'broadcast', chat[0], chat_title, ok=0,
+                              detail='PEER_FLOOD, рассылка выключена')
+                    await notify(
+                        f'⛔️ <b>Аккаунт ограничен Telegram</b>\n\n'
+                        f'Аккаунт: {client_data.first_name}\n'
+                        f'Рассылка в чаты выключена автоматически. Подробности у @spambot.\n\n{e}')
+                    break
+
                 except Exception as e:
                     print(f'broadcast send error: {e}')
                     log_event(phone, 'broadcast', chat[0], chat_title, ok=0, detail=e)
@@ -3895,14 +3958,224 @@ def start_broadcast(app):
     asyncio.create_task(broadcast_loop(app))
 
 
+async def prepare_blast_message(manager, client, source_message, report):
+    """Кладём сообщение админа в чат воркера с управляющим ботом и возвращаем его id.
+
+    Воркер обязан написать боту первым: без общего чата копировать некуда.
+    """
+    try:
+        await client.send_message(BOT_LINK, random.choice(emojies))
+
+    except YouBlockedUser:
+        # аккаунт держит бота в чёрном списке — снимаем блокировку и пробуем ещё раз
+        try:
+            await client.unblock_user(BOT_ID)
+            await client.send_message(BOT_LINK, random.choice(emojies))
+        except Exception as e:
+            await report(f'⛔️ Аккаунт заблокировал управляющего бота, снять блокировку не вышло.\n\n'
+                         f'Открой с этого аккаунта чат с @{BOT_LINK}, разблокируй его и напиши /start.\n\n'
+                         f'<pre>{e}</pre>')
+            return None
+
+    except PeerFlood as e:
+        await report(f'⛔️ <b>Аккаунт ограничен Telegram</b> (PEER_FLOOD)\n\n'
+                     f'Рассылка не запущена. Причины и сроки — у @spambot.\n\n<pre>{e}</pre>')
+        return 'limited'
+
+    except Exception as e:
+        await report(f'⛔️ Аккаунт не смог написать управляющему боту.\n\n<pre>{e}</pre>')
+        return None
+
+    try:
+        me = client.me or await client.get_me()
+        await manager.copy_message(me.id, source_message.chat.id, source_message.id)
+    except Exception as e:
+        await report(f'⛔️ Не удалось передать сообщение аккаунту.\n\n<pre>{e}</pre>')
+        return None
+
+    prepared = None
+    try:
+        async for item in client.get_chat_history(BOT_ID, limit=1):
+            prepared = item
+    except Exception as e:
+        await report(f'⛔️ Не удалось прочитать сообщение для рассылки.\n\n<pre>{e}</pre>')
+        return None
+
+    if prepared is None:
+        await report('⛔️ Сообщение для рассылки не нашлось в чате аккаунта с ботом.')
+        return None
+
+    return prepared.id
+
+
+async def dm_blast(manager, client, session, source_message, recipients, cooldown, reply_to):
+    """Рассылка по ЛС отдельной задачей: с прогрессом, остановкой и реакцией на лимиты."""
+    state = {'stop': False, 'sent': 0, 'failed': 0, 'total': len(recipients)}
+    running_dm_blasts[session] = state
+    account_name = client.me.first_name if client.me else session
+
+    async def report(text):
+        try:
+            await reply_to.reply(text)
+        except Exception as e:
+            print(f'[dm_blast] сообщение админу не ушло: {e}')
+
+    try:
+        message_id = await prepare_blast_message(manager, client, source_message, report)
+
+        if message_id == 'limited':
+            mark_limited(session, 'PEER_FLOOD при подготовке рассылки')
+            log_event(session, 'dm_blast', ok=0, detail='PEER_FLOOD при подготовке')
+            return
+
+        if message_id is None:
+            log_event(session, 'dm_blast', ok=0, detail='не удалось подготовить сообщение')
+            return
+
+        progress = None
+        try:
+            progress = await reply_to.reply(
+                f'📨 <b>Рассылка запущена</b> — {account_name}\n'
+                f'Получателей: <b>{len(recipients)}</b>\n\n'
+                f'<i>Остановить — /finish</i>')
+        except Exception:
+            pass
+
+        consecutive = 0
+        last_edit = time.time()
+        last_error_report = 0
+        stopped = None
+
+        for number, raw_person in enumerate(recipients, 1):
+
+            if state['stop']:
+                stopped = 'остановлено командой /finish'
+                break
+
+            if not client.is_connected:
+                stopped = 'аккаунт отключился'
+                break
+
+            person = normalize_chat_link(raw_person)
+
+            try:
+                await client.copy_message(person, BOT_ID, message_id)
+                state['sent'] += 1
+                consecutive = 0
+
+            except PeerFlood as e:
+                # аккаунт ограничен: продолжать бессмысленно и только усугубит
+                mark_limited(session, 'PEER_FLOOD при рассылке по ЛС')
+                stopped = ('Telegram ограничил аккаунт (PEER_FLOOD). Проверь @spambot — '
+                           'новые рассылки с него бот не запустит сутки')
+                print(f'[dm_blast] PeerFlood на {session}: {e}')
+                break
+
+            except FloodWait as e:
+                print(f'[dm_blast] FLOOD_WAIT {e.value} на {session}')
+                await asyncio.sleep(e.value + 2)
+                try:
+                    await client.copy_message(person, BOT_ID, message_id)
+                    state['sent'] += 1
+                    consecutive = 0
+                except PeerFlood:
+                    mark_limited(session, 'PEER_FLOOD при рассылке по ЛС')
+                    stopped = 'Telegram ограничил аккаунт (PEER_FLOOD). Проверь @spambot'
+                    break
+                except Exception as retry_error:
+                    state['failed'] += 1
+                    consecutive += 1
+                    print(f'[dm_blast] {raw_person}: {retry_error}')
+
+            except Exception as e:
+                state['failed'] += 1
+                consecutive += 1
+
+                # об ошибках пишем не чаще раза в минуту: раньше на каждого адресата уходило сообщение
+                if time.time() - last_error_report > 60:
+                    last_error_report = time.time()
+                    await report(f'📨 Рассылка {account_name}: ошибок {state["failed"]}, '
+                                 f'последняя на {raw_person.strip()}\n\n<pre>{e}</pre>')
+
+                if consecutive >= 10:
+                    stopped = f'{consecutive} ошибок подряд — похоже, аккаунт ограничен'
+                    break
+
+            if progress and time.time() - last_edit > 20:
+                last_edit = time.time()
+                try:
+                    await progress.edit(
+                        f'📨 <b>Рассылка</b> — {account_name}\n'
+                        f'Отправлено: <b>{state["sent"]}</b> · ошибок: <b>{state["failed"]}</b> · '
+                        f'осталось: <b>{len(recipients) - number}</b>\n\n'
+                        f'<i>Остановить — /finish</i>')
+                except Exception:
+                    pass
+
+            await asyncio.sleep(await cooldown())
+
+        summary = (f'✅ <b>Рассылка завершена</b> — {account_name}\n\n'
+                   f'Получателей: <b>{len(recipients)}</b>\n'
+                   f'Отправлено: <b>{state["sent"]}</b>\n'
+                   f'Ошибок: <b>{state["failed"]}</b>')
+        if stopped:
+            summary += f'\n\n⚠️ {stopped}'
+
+        if progress:
+            try:
+                await progress.edit(summary)
+            except Exception:
+                await report(summary)
+        else:
+            await report(summary)
+
+        log_event(session, 'dm_blast', ok=0 if stopped else 1,
+                  detail=f'отправлено {state["sent"]}, ошибок {state["failed"]}'
+                         + (f', {stopped}' if stopped else ''))
+
+        await notify(f'📨 <b>Рассылка по ЛС завершена</b>\n\n'
+                     f'Аккаунт: {account_name}\n'
+                     f'Отправлено: {state["sent"]}\n'
+                     f'Ошибок: {state["failed"]}'
+                     + (f'\n{stopped}' if stopped else ''))
+
+    except Exception as e:
+        print(f'[dm_blast] {e}')
+        log_event(session, 'dm_blast', ok=0, detail=e)
+        await report(f'⛔️ Рассылка прервана ошибкой\n\n<pre>{e}</pre>')
+
+    finally:
+        running_dm_blasts.pop(session, None)
+
+
 def setup_worker(app):
+
+    # аккаунты, добавленные на ходу, иначе не попадают в heartbeat и монитор
+    if app not in worker_apps:
+        worker_apps.append(app)
 
     _client_data_cache = None
 
     async def get_me_cached():
+        """Данные аккаунта без лишних RPC: pyrogram складывает их в client.me при старте."""
         nonlocal _client_data_cache
-        if _client_data_cache is None:
+
+        if _client_data_cache is not None:
+            return _client_data_cache
+
+        if app.me is not None:
+            _client_data_cache = app.me
+            return _client_data_cache
+
+        try:
             _client_data_cache = await app.get_me()
+        except Exception as e:
+            # кешируем и неудачу: иначе каждое новое сообщение снова идёт в GetFullUser и копит FLOOD_WAIT
+            print(f'[{app.name}] данные аккаунта не получены: {e}')
+            _client_data_cache = SimpleNamespace(id=None, phone_number=app.name, first_name=app.name,
+                                                 last_name=None, username=None, mention=app.name,
+                                                 is_premium=False, is_restricted=False)
+
         return _client_data_cache
 
     _broadcast_checked = False
@@ -4236,6 +4509,9 @@ def setup_worker(app):
         if not settings or not settings[0][10]:
             return
 
+        if account_limit(client_data.phone_number):
+            return
+
         dm_text = settings[0][11]
         dm_daily_limit = settings[0][12]
         dm_delay = settings[0][13]
@@ -4283,6 +4559,17 @@ def setup_worker(app):
                 f'Аккаунт: {client_data.first_name}\n'
                 f'Группа: {message.chat.title}\n'
                 f'Получатель: @{sender_name}')
+        except PeerFlood as e:
+            # аккаунт ограничен: выключаем аутрич, чтобы не долбить дальше
+            mark_limited(client_data.phone_number, 'PEER_FLOOD при аутриче в ЛС')
+            sql_edit('UPDATE workers SET dm_enabled = 0 WHERE session = ?', (client_data.phone_number,))
+            log_event(client_data.phone_number, 'dm', message.chat.id, message.chat.title,
+                      ok=0, detail='PEER_FLOOD, аутрич выключен')
+            await notify(
+                f'⛔️ <b>Аккаунт ограничен Telegram</b>\n\n'
+                f'Аккаунт: {client_data.first_name}\n'
+                f'Аутрич в ЛС выключен автоматически. Подробности у @spambot.\n\n{e}')
+
         except Exception as e:
             print(f'dm_outreach error: {e}')
             log_event(client_data.phone_number, 'dm', message.chat.id, message.chat.title, ok=0, detail=e)
@@ -4396,8 +4683,20 @@ async def client_state(client, is_bot=False):
     except Exception:
         pass
 
+    # имя и телефон берём из кеша pyrogram — это не стоит ни одного запроса
+    cached_me = getattr(client, 'me', None)
+    if cached_me is not None:
+        info['title'] = cached_me.first_name
+        info['session'] = cached_me.username if is_bot else cached_me.phone_number
+    else:
+        info['session'] = client.name
+
     if not info['connected']:
         info['error'] = 'клиент не подключён'
+        return info
+
+    # живой RPC проверяем редко: GetFullUser дорогой и на нём уже ловили FLOOD_WAIT
+    if time.time() - LAST_RPC_OK.get(client.name, 0) < RPC_PROBE_INTERVAL:
         return info
 
     try:
@@ -4452,9 +4751,17 @@ async def collect_state():
 
     state['processes'] = {
         'broadcast': sorted(running_broadcasts),
+        'dm_blasts': {session: dict(progress) for session, progress in running_dm_blasts.items()},
         'parsing': bool(working),
         'tasks': len(asyncio.all_tasks()),
     }
+
+    limits = sql_select('SELECT session, reason, noticed_at FROM account_limits')
+    state['limited'] = [{'session': row[0], 'reason': row[1], 'noticed_at': row[2]}
+                        for row in (limits or [])
+                        if time.time() - (row[2] or 0) < LIMIT_COOLDOWN]
+
+    state['rpc_interval'] = RPC_PROBE_INTERVAL
 
     return state
 
