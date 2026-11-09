@@ -85,8 +85,39 @@ def start_job(kind, account=None, total=0, title=''):
     return job
 
 
+_stop_check_at = 0
+
+
+def pull_stop_requests():
+    """Забираем просьбы об остановке из базы — так кнопка в мониторе достаёт до бота.
+
+    Монитор отдельный процесс, поэтому команда идёт через таблицу, а не через память.
+    Проверяем не чаще раза в 2 секунды: парсинг крутится по пять шагов в секунду.
+    """
+    global _stop_check_at
+
+    now = time.time()
+    if now - _stop_check_at < 2:
+        return
+    _stop_check_at = now
+
+    rows = sql_select('SELECT target FROM stop_requests')
+    if not rows:
+        return
+
+    for row in rows:
+        target = row[0]
+        if target == 'all':
+            stop_jobs()
+        elif target in running_jobs:
+            running_jobs[target]['stop'] = True
+        sql_edit('DELETE FROM stop_requests WHERE target = ?', (target,))
+
+
 def job_tick(job, done=None, errors=None, total=None):
     """Отмечаем продвижение: по updated_at монитор понимает, что операция не встала."""
+    pull_stop_requests()
+
     if done is not None:
         job['done'] = done
     if errors is not None:

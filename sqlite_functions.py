@@ -59,6 +59,10 @@ with sqlite3.connect("database.db") as connection:
         'ALTER TABLE managers ADD COLUMN ai_token TEXT',
         'ALTER TABLE managers ADD COLUMN ai_model TEXT',
 
+        # просьбы остановить операцию: монитор пишет сюда, бот забирает
+        'CREATE TABLE IF NOT EXISTS stop_requests'
+        '(target TEXT PRIMARY KEY, requested_at REAL)',
+
         # аккаунты, которых Telegram ограничил (PEER_FLOOD и подобное)
         'CREATE TABLE IF NOT EXISTS account_limits'
         '(session TEXT PRIMARY KEY, reason TEXT, noticed_at REAL)',

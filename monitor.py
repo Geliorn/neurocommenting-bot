@@ -277,6 +277,33 @@ def check_proxy(proxy, target=TG_TARGETS[0]):
         sock.close()
 
 
+def pending_stops():
+    """Какие операции уже попросили остановить, но бот ещё не забрал просьбу."""
+    try:
+        con = sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True, timeout=2)
+        rows = con.execute('SELECT target FROM stop_requests').fetchall()
+        con.close()
+        return [row[0] for row in rows]
+    except Exception:
+        return []
+
+
+def request_stop(target):
+    """Просим бота остановить операцию. Он отдельный процесс, поэтому через базу."""
+    try:
+        con = sqlite3.connect(DB_FILE, timeout=5)
+        con.execute('INSERT OR REPLACE INTO stop_requests(target, requested_at) VALUES(?, ?)',
+                    (target, time.time()))
+        con.commit()
+        con.close()
+    except Exception as e:
+        return False, f'не записали просьбу: {e}'
+
+    if target == 'all':
+        return True, 'просьба отправлена: бот остановит все операции на ближайшем шаге'
+    return True, 'просьба отправлена: операция остановится на ближайшем шаге'
+
+
 def route_info(ip=TG_TARGETS[0][0]):
     """Через какой интерфейс сейчас идёт трафик до Telegram — факт, а не условие."""
     try:
@@ -488,6 +515,7 @@ def collect(force_probe=False, with_logs=False):
         'events': read_events(),
         'diagnosis': diagnose(state, state_error, service, probes),
         'accounts': accounts_from_db(state),
+        'stopping': pending_stops(),
     }
     if with_logs:
         data['logs'] = read_logs()
@@ -644,10 +672,14 @@ def render_text(data, color=True):
     lines.append('  рассылка в чаты ' + (', '.join(processes.get('broadcast') or []) or 'не запущена'))
 
     jobs = processes.get('jobs') or []
+    stopping = data.get('stopping') or []
     if jobs:
         for job in jobs:
             idle = time.time() - job.get('updated_at', time.time())
-            lines.append('  ' + paint(job_line(job), 'warn' if idle > JOB_STUCK_AFTER else 'ok', color))
+            text = job_line(job)
+            if job.get('id') in stopping or 'all' in stopping:
+                text += ' · \u23f9 останавливается'
+            lines.append('  ' + paint(text, 'warn' if idle > JOB_STUCK_AFTER else 'ok', color))
     else:
         lines.append('  операций        нет')
 
@@ -943,14 +975,19 @@ async function render() {
   let proc = '<div class="card"><h2>Операции</h2>';
   const jobs = p.jobs || [];
   if (!jobs.length) proc += '<div class="dim">сейчас ничего не выполняется</div>';
+  const stopping = d.stopping || [];
   jobs.forEach(j => {
     const spent = Math.max(d.ts - (j.started_at || d.ts), 1);
     const idle = d.ts - (j.updated_at || j.started_at || d.ts);
     const rate = (j.done || 0) / spent * 60;
     const pct = j.total ? Math.round((j.done || 0) / j.total * 100) : 0;
+    const asked = stopping.includes(j.id) || stopping.includes('all');
     proc += '<div class="row"><span>' + esc(JOBS[j.kind] || j.kind)
       + (j.title ? ' <span class="dim">· ' + esc(j.title) + '</span>' : '')
-      + '</span><span>' + (j.done || 0) + (j.total ? '/' + j.total : '') + '</span></div>'
+      + '</span><span>' + (j.done || 0) + (j.total ? '/' + j.total : '')
+      + (asked ? ' <span class="warn">⏹ останавливается</span>'
+               : ' <button class="danger" style="padding:2px 8px;font-size:12px" onclick="stopJob(\''
+                 + esc(j.id) + '\')">Стоп</button>') + '</span></div>'
       + '<div class="bars" style="height:8px"><i style="flex:' + Math.max(pct, 1)
       + '" ></i><i style="flex:' + Math.max(100 - pct, 1) + ';background:var(--line)"></i></div>'
       + '<div class="f">идёт ' + age(spent) + (j.errors ? ' · ошибок ' + j.errors : '')
@@ -959,6 +996,11 @@ async function render() {
       + (idle > 600 ? ' · <span class="warn">⚠️ не двигается ' + age(idle) + '</span>' : '')
       + '</div>';
   });
+  if (jobs.length > 1) {
+    proc += '<div class="row"><span class="dim">все операции</span><span>'
+      + '<button class="danger" style="padding:2px 8px;font-size:12px" '
+      + 'onclick="stopJob(\'all\')">Остановить все</button></span></div>';
+  }
   proc += row('рассылка в чаты', esc((p.broadcast || []).join(', ') || 'не запущена'))
     + row('задач в цикле', esc(p.tasks === undefined ? '—' : p.tasks))
     + row('клиентов', esc((st.managers || []).length + (st.workers || []).length));
@@ -1002,6 +1044,19 @@ async function render() {
   document.getElementById('cards').innerHTML = cards.join('');
 }
 
+async function stopJob(id) {
+  if (!confirm('Остановить операцию? Уже сделанное сохранится.')) return;
+  const out = document.getElementById('result');
+  out.textContent = 'прошу остановиться…';
+  try {
+    const r = await fetch('/api/stopjob?job=' + encodeURIComponent(id),
+                          {method: 'POST', headers: {'X-CSRF-Token': TOKEN}});
+    const j = await r.json();
+    out.innerHTML = (j.ok ? '<span class="ok">✅ </span>' : '<span class="down">❌ </span>') + esc(j.message);
+  } catch (e) { out.innerHTML = '<span class="down">❌ ' + esc(e) + '</span>'; }
+  setTimeout(render, 1000);
+}
+
 async function act(what, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
   const out = document.getElementById('result');
@@ -1033,6 +1088,7 @@ def serve(port):
     """Страница только на 127.0.0.1; чтение открыто, действия — по токену."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from secrets import token_urlsafe
+    from urllib.parse import parse_qs, urlparse
 
     token = token_urlsafe(24)
     allowed_origins = (f'http://127.0.0.1:{port}', f'http://localhost:{port}')
@@ -1064,28 +1120,40 @@ def serve(port):
             return not origin or origin in allowed_origins
 
         def do_GET(self):
-            if self.path in ('/', '/index.html'):
+            path = urlparse(self.path).path
+            if path in ('/', '/index.html'):
                 return self._send(PAGE.replace('__TOKEN__', token), 'text/html; charset=utf-8')
-            if self.path == '/api/state':
+            if path == '/api/state':
                 return self._json(collect())
-            if self.path == '/api/logs':
+            if path == '/api/logs':
                 return self._json({'lines': read_logs(80)})
             self._json({'ok': False, 'message': 'нет такого адреса'}, code=404)
 
         def do_POST(self):
+            parts = urlparse(self.path)
+            path, query = parts.path, parse_qs(parts.query)
+
             if not self._authorized():
                 return self._json({'ok': False, 'message': 'запрос без токена страницы'}, code=403)
 
-            if self.path == '/api/probe':
+            if path == '/api/probe':
                 data = collect(force_probe=True)
                 return self._json({'ok': True, 'message': 'пробы обновлены: ' + data['diagnosis']['headline']})
-            if self.path == '/api/restart':
+            if path == '/api/restart':
                 ok, message = do_restart()
                 log_line(f'страница: перезапуск — {message}')
                 return self._json({'ok': ok, 'message': message})
-            if self.path in ('/api/start', '/api/stop'):
-                ok, message = systemctl(self.path.rsplit('/', 1)[1])
+            if path in ('/api/start', '/api/stop'):
+                ok, message = systemctl(path.rsplit('/', 1)[1])
                 log_line(f'страница: {message}')
+                return self._json({'ok': ok, 'message': message})
+
+            if path == '/api/stopjob':
+                target = query.get('job', [''])[0]
+                if not target:
+                    return self._json({'ok': False, 'message': 'не указана операция'}, code=400)
+                ok, message = request_stop(target)
+                log_line(f'страница: остановка операции {target} — {message}')
                 return self._json({'ok': ok, 'message': message})
             self._json({'ok': False, 'message': 'нет такого действия'}, code=404)
 
