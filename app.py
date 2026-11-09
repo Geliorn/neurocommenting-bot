@@ -977,6 +977,40 @@ def setup_manager(app):
             
             await accounts(sent)
         
+    @app.on_message(filters.command('Отмена ❌', ''))
+    async def cancel_anything(_, message):
+        """Отмена работает всегда, а не только внутри активного ожидания."""
+
+        if message.from_user.id not in admins:
+            return
+
+        await remove_handler(message.from_user.id)
+        await message.reply('<i>Отменено.</i>', reply_markup=MAIN_KEYBOARD)
+
+    @app.on_error()
+    async def report_handler_error(_, exc, failed_handler, update, users, chats):
+        """Любая невыловленная ошибка доходит до админа, а не только в лог.
+
+        Раньше поток просто умирал: ни сообщения, ни рабочей клавиатуры.
+        """
+        print(f'[handler] {type(exc).__name__}: {exc}')
+        log_event(None, 'crash', ok=0, detail=f'{type(exc).__name__}: {exc}')
+
+        # пишем тому админу, чьё сообщение разбирали; если не понять — всем
+        targets = [user_id for user_id in (users or {}) if user_id in admins] or list(admins)
+
+        for admin in targets:
+            try:
+                await remove_handler(admin)
+                await app.send_message(
+                    admin,
+                    f'⛔️ <b>Операция прервалась ошибкой</b>\n\n'
+                    f'<pre>{type(exc).__name__}: {exc}</pre>\n\n'
+                    f'Ожидание ввода снято — можно начинать заново.',
+                    reply_markup=MAIN_KEYBOARD)
+            except Exception as e:
+                print(f'[handler] сообщение об ошибке не доставлено: {e}')
+
     @app.on_message(filters.command('Меню 🌴', ''))
     async def callback(_, message):
         
@@ -4016,7 +4050,7 @@ async def dm_blast(manager, client, session, source_message, recipients, cooldow
 
     async def report(text):
         try:
-            await reply_to.reply(text)
+            await reply_to.reply(text, reply_markup=MAIN_KEYBOARD)
         except Exception as e:
             print(f'[dm_blast] сообщение админу не ушло: {e}')
 
