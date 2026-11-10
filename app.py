@@ -452,6 +452,159 @@ def write_check_csv(rows):
     return path
 
 
+# сбор аудитории: пределы и паузы, чтобы не упереться в лимиты Telegram
+
+AUDIENCE_MAX_MEMBERS = 10000
+AUDIENCE_MAX_MESSAGES = 50000
+AUDIENCE_PAUSE = 0.5
+MEMBERS_PAUSE_EVERY = 200
+ACTIVE_PAUSE_EVERY = 500
+
+USER_STATUS_LABELS = {
+    'ONLINE': 'в сети', 'OFFLINE': 'не в сети', 'RECENTLY': 'недавно',
+    'LAST_WEEK': 'на этой неделе', 'LAST_MONTH': 'в этом месяце', 'LONG_AGO': 'давно',
+}
+
+MEMBER_ROLE_LABELS = {
+    'OWNER': 'владелец', 'ADMINISTRATOR': 'админ', 'MEMBER': 'участник',
+    'RESTRICTED': 'ограничен', 'LEFT': 'вышел', 'BANNED': 'забанен',
+}
+
+AUDIENCE_COLUMNS = ('id', 'username', 'имя', 'фамилия', 'роль', 'сообщений',
+                    'премиум', 'бот', 'удалён', 'верифицирован', 'скам', 'ограничен',
+                    'статус', 'был в сети', 'язык', 'вступил', 'первое сообщение',
+                    'последнее сообщение')
+
+
+def enum_label(value, labels):
+    name = getattr(value, 'name', None) or str(value or '')
+    return labels.get(name.upper(), name.lower())
+
+
+def fmt_moment(value):
+    """Дату приводим к читаемому виду, что бы ни пришло."""
+    if not value:
+        return ''
+    try:
+        return value.strftime('%Y-%m-%d %H:%M')
+    except AttributeError:
+        try:
+            return datetime.fromtimestamp(float(value)).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            return str(value)
+
+
+def yes(flag):
+    return 'да' if flag else ''
+
+
+def audience_row(user):
+    """Максимум того, что Telegram отдаёт о человеке в одном запросе."""
+    return {
+        'id': user.id,
+        'username': user.username or '',
+        'имя': user.first_name or '',
+        'фамилия': user.last_name or '',
+        'роль': '',
+        'сообщений': '',
+        'премиум': yes(getattr(user, 'is_premium', False)),
+        'бот': yes(getattr(user, 'is_bot', False)),
+        'удалён': yes(getattr(user, 'is_deleted', False)),
+        'верифицирован': yes(getattr(user, 'is_verified', False)),
+        'скам': yes(getattr(user, 'is_scam', False) or getattr(user, 'is_fake', False)),
+        'ограничен': yes(getattr(user, 'is_restricted', False)),
+        'статус': enum_label(getattr(user, 'status', None), USER_STATUS_LABELS),
+        'был в сети': fmt_moment(getattr(user, 'last_online_date', None)),
+        'язык': getattr(user, 'language_code', '') or '',
+        'вступил': '',
+        'первое сообщение': '',
+        'последнее сообщение': '',
+    }
+
+
+async def collect_members(client, chat, job, on_progress=None):
+    """Участники чата. Для каналов Telegram отдаёт список только администраторам."""
+    rows = []
+    seen = set()
+
+    async for member in client.get_chat_members(chat.id, limit=AUDIENCE_MAX_MEMBERS):
+
+        if job['stop']:
+            break
+
+        user = getattr(member, 'user', None)
+        if not user or user.id in seen:
+            continue
+
+        seen.add(user.id)
+        row = audience_row(user)
+        row['роль'] = enum_label(getattr(member, 'status', None), MEMBER_ROLE_LABELS)
+        row['вступил'] = fmt_moment(getattr(member, 'joined_date', None))
+        rows.append(row)
+
+        job_tick(job, done=len(rows))
+
+        if len(rows) % MEMBERS_PAUSE_EVERY == 0:
+            if on_progress:
+                await on_progress(len(rows), None)
+            await asyncio.sleep(AUDIENCE_PAUSE)
+
+    return rows
+
+
+async def collect_active(client, chat, days, job, on_progress=None):
+    """Кто писал в чате за период. Идём по истории назад, пока не упрёмся в дату."""
+    cutoff = time.time() - days * 86400
+    people = {}
+    scanned = 0
+
+    async for message in client.get_chat_history(chat.id, limit=AUDIENCE_MAX_MESSAGES):
+
+        if job['stop']:
+            break
+
+        moment = getattr(message, 'date', None)
+        stamp = moment.timestamp() if hasattr(moment, 'timestamp') else 0
+        if stamp and stamp < cutoff:
+            break
+
+        scanned += 1
+        user = getattr(message, 'from_user', None)
+
+        if user and not getattr(user, 'is_bot', False):
+            row = people.get(user.id)
+            if row is None:
+                row = audience_row(user)
+                row['сообщений'] = 0
+                row['последнее сообщение'] = fmt_moment(moment)
+                people[user.id] = row
+            row['сообщений'] += 1
+            row['первое сообщение'] = fmt_moment(moment)
+
+        job_tick(job, done=len(people), total=0)
+
+        if scanned % ACTIVE_PAUSE_EVERY == 0:
+            if on_progress:
+                await on_progress(len(people), scanned)
+            await asyncio.sleep(AUDIENCE_PAUSE)
+
+    return sorted(people.values(), key=lambda row: row['сообщений'], reverse=True)
+
+
+def write_audience_csv(rows, kind, chat_label):
+    """Выгрузка одним CSV: разделитель ; и BOM, чтобы Excel открывал без настроек."""
+    name = f'{kind}_{safe_filename(chat_label)}_{datetime.now().strftime("%Y-%m-%d_%H-%M")}.csv'
+    path = os.path.join(BOT_DIR, name)
+
+    with open(path, 'w', encoding='utf-8-sig', newline='') as report:
+        writer = csv.DictWriter(report, fieldnames=list(AUDIENCE_COLUMNS), delimiter=';',
+                                extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return path
+
+
 def sent_today_count():
     """Счётчик отправленного за сутки с автосбросом в полночь."""
     global SENT_TODAY, SENT_DATE
@@ -1530,6 +1683,7 @@ def setup_manager(app):
                 if limit:
                     keyboard.append([InlineKeyboardButton('Снять отметку об ограничении ♻️',
                                                           callback_data=f'clearlimit {client_data.phone_number}')])
+                keyboard.append([InlineKeyboardButton('Сбор аудитории 👥', callback_data=f'audience {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Автолайки 👍', callback_data=f'autolikes {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Автоответы 💬', callback_data=f'autoreply_menu {client_data.phone_number}')])
                 keyboard.append([InlineKeyboardButton('Аутрич в ЛС 📨', callback_data=f'outreach {client_data.phone_number}')])
@@ -2740,6 +2894,114 @@ def setup_manager(app):
             ]
             await callback_query.message.edit(text, reply_markup=InlineKeyboardMarkup(kb))
 
+        elif data.startswith('audience ') and len(data.split()) == 2:
+
+            session = data.split()[1]
+            await callback_query.message.edit(
+                '👥 <b>Сбор аудитории</b>\n\n'
+                'Собираем из-под этого аккаунта — значит доступны и закрытые чаты, '
+                'в которых он состоит.\n\n'
+                'Выберите, что собрать:',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('Участники чата 👥', callback_data=f'aud_members {session}')],
+                    [InlineKeyboardButton('Активные за период 🔥', callback_data=f'aud_active {session}')],
+                    [InlineKeyboardButton('Назад к аккаунту ◀️', callback_data=f'user {session}')],
+                ]))
+
+        elif data.startswith('aud_members ') or data.startswith('aud_active '):
+
+            session = data.split()[1]
+            mode = 'members' if data.startswith('aud_members') else 'active'
+
+            client = workers_list.get(session)
+            if client is None or not client.is_connected:
+                await callback_query.message.edit(
+                    '⛔️ Аккаунт не подключён — собирать нечем',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Назад ◀️', callback_data=f'audience {session}')]]))
+                return
+
+            limit = account_limit(session)
+            if limit:
+                await callback_query.message.edit(
+                    f'⛔️ Аккаунт ограничен Telegram: {limit["reason"]}. Проверь @spambot',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Назад ◀️', callback_data=f'audience {session}')]]))
+                return
+
+            if job_running('audience', session):
+                await callback_query.message.edit(
+                    '⚠️ С этого аккаунта уже идёт сбор. Останови его командой /finish',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Назад ◀️', callback_data=f'audience {session}')]]))
+                return
+
+            await callback_query.message.edit(
+                '👥 Пришлите ссылку на чат или @username.\n\n'
+                '<i>Аккаунт должен состоять в этом чате.</i>')
+
+            async def wait(link_message):
+
+                await remove_handler(link_message.from_user.id)
+
+                chat_link = normalize_chat_link(link_message.text or '')
+                if not chat_link:
+                    await callback_query.message.edit('🤷‍♂️ Не разобрал ссылку')
+                    return
+
+                try:
+                    chat = await client.get_chat(chat_link)
+                except Exception as e:
+                    await callback_query.message.edit(
+                        f'⛔️ Аккаунт не видит этот чат — он в нём не состоит?\n\n<pre>{e}</pre>',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Назад ◀️', callback_data=f'audience {session}')]]))
+                    return
+
+                chat_type = getattr(getattr(chat, 'type', None), 'name', '').upper()
+
+                if mode == 'members' and 'CHANNEL' in chat_type:
+                    await callback_query.message.edit(
+                        f'⛔️ <b>{chat.title}</b> — это канал.\n\n'
+                        'Список подписчиков Telegram отдаёт только администраторам. '
+                        'Если аккаунт не админ, собери вместо этого активных за период '
+                        'в чате обсуждения.',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton('Активные за период 🔥',
+                                                  callback_data=f'aud_active {session}')],
+                            [InlineKeyboardButton('Назад ◀️', callback_data=f'audience {session}')]]))
+                    return
+
+                if mode == 'members':
+                    asyncio.create_task(audience_job(app, client, session, chat, 'members', 0,
+                                                     callback_query.message))
+                    return
+
+                await callback_query.message.edit(
+                    f'🔥 <b>{chat.title}</b>\n\n'
+                    'За сколько последних дней собрать активных? Пришлите число, например '
+                    '<code>7</code> или <code>30</code>.')
+
+                async def wait_days(days_message):
+
+                    await remove_handler(days_message.from_user.id)
+
+                    try:
+                        days = max(1, int((days_message.text or '').strip()))
+                    except ValueError:
+                        await callback_query.message.edit(
+                            '😛 Нужно число дней',
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton('Назад ◀️', callback_data=f'audience {session}')]]))
+                        return
+
+                    asyncio.create_task(audience_job(app, client, session, chat, 'active', days,
+                                                     callback_query.message))
+
+                await add_handler(callback_query.from_user.id, wait_days)
+
+            await add_handler(callback_query.from_user.id, wait)
+
         elif data.startswith('clearlimit '):
 
             session = data.split()[1]
@@ -3404,8 +3666,31 @@ def setup_manager(app):
 
             await add_handler(callback_query.from_user.id, wait_in_background, accepts_documents=True)
 
-        elif data.startswith('parse_comments'):
-            
+        elif data == 'parse_comments':
+
+            kb = []
+            for phone, worker in workers_list.items():
+                if not worker.is_connected:
+                    continue
+                name = worker.me.first_name if worker.me else phone
+                kb.append([InlineKeyboardButton(f'{name} (+{phone})',
+                                                callback_data=f'parse_comments {phone}')])
+
+            if not kb:
+                await callback_query.answer('Нет подключённых аккаунтов', show_alert=True)
+                return
+
+            kb.append([InlineKeyboardButton('Назад ◀️', callback_data='Main menu')])
+            await callback_query.message.edit(
+                '💬 <b>Парсинг комментаторов</b>\n\n'
+                'Под каким аккаунтом собирать? В закрытый канал попадёт только тот, '
+                'кто в нём состоит.',
+                reply_markup=InlineKeyboardMarkup(kb))
+
+        elif data.startswith('parse_comments '):
+
+            parse_session = data.split()[1]
+
             sent = await app.send_message(
                 callback_query.from_user.id, "🌴 Введите ссылку на канал:",
                 reply_markup=ReplyKeyboardMarkup([['Отмена ❌']], resize_keyboard=True))
@@ -3434,7 +3719,7 @@ def setup_manager(app):
                     
                         chat_id = normalize_chat_link(message.text)
 
-                        client = random.choice(list(workers_list.values()))
+                        client = workers_list[parse_session]
                         
                         msgs = []
                         user_counts = {}  # {user_id: {'username': str|None, 'count': int}}
@@ -3473,16 +3758,14 @@ def setup_manager(app):
                             if not working or job['stop']:
                                 break
 
-                            # берём только живые аккаунты: с отвалившимся парсить нечем
-                            alive = [worker for worker in workers_list.values() if worker.is_connected]
-                            if not alive:
+                            # парсим именно выбранным аккаунтом: другой может не видеть канал
+                            if not client.is_connected:
                                 await callback_query.message.reply(
-                                    '⛔️ <b>Парсинг остановлен:</b> ни один аккаунт не подключён.\n\n'
+                                    '⛔️ <b>Парсинг остановлен:</b> аккаунт отключился.\n\n'
                                     'Собранное отправлю файлами.')
                                 break
 
                             try:
-                                client = random.choice(alive)
                                 async for message in client.get_discussion_replies(chat_id, message_id):
 
                                     if message.from_user:
@@ -4324,6 +4607,123 @@ async def dm_blast(manager, client, session, source_message, recipients, cooldow
 
     finally:
         finish_job(job)
+
+
+async def audience_job(manager, client, session, chat, mode, days, reply_to):
+    """Сбор аудитории отдельной задачей: с прогрессом, остановкой и реакцией на лимиты."""
+    label = 'участники' if mode == 'members' else f'активные за {days} дн'
+    job = start_job('audience', account=session, title=f'{chat.title} — {label}')
+
+    async def report(text, markup=None):
+        try:
+            await reply_to.reply(text, reply_markup=markup or MAIN_KEYBOARD)
+        except Exception as e:
+            print(f'[audience] сообщение админу не ушло: {e}')
+
+    progress = None
+    try:
+        total_known = ''
+        if mode == 'members':
+            try:
+                total_known = await client.get_chat_members_count(chat.id)
+                job_tick(job, total=min(int(total_known), AUDIENCE_MAX_MEMBERS))
+            except Exception as e:
+                print(f'[audience] не узнали число участников: {e}')
+
+        progress = await reply_to.reply(
+            f'👥 <b>Собираю: {label}</b>\n'
+            f'Чат: {chat.title}\n'
+            + (f'Участников в чате: {total_known}\n' if total_known else '')
+            + f'\n<i>Остановить — /finish</i>')
+
+        last_edit = [time.time()]
+
+        async def on_progress(found, scanned):
+            if time.time() - last_edit[0] < 20:
+                return
+            last_edit[0] = time.time()
+            try:
+                await progress.edit(
+                    f'👥 <b>Собираю: {label}</b>\n'
+                    f'Чат: {chat.title}\n\n'
+                    f'Найдено людей: <b>{found}</b>'
+                    + (f'\nПросмотрено сообщений: <b>{scanned}</b>' if scanned else '')
+                    + f'\n\n<i>Остановить — /finish</i>')
+            except Exception:
+                pass
+
+        async def finish(finishmessage):
+            if finishmessage.text == '/finish':
+                asked = stop_jobs()
+                await finishmessage.reply(f'⏹ Останавливаю операции: {asked}')
+
+        await add_handler(reply_to.chat.id, finish)
+
+        if mode == 'members':
+            rows = await collect_members(client, chat, job, on_progress)
+        else:
+            rows = await collect_active(client, chat, days, job, on_progress)
+
+        await remove_handler(reply_to.chat.id)
+
+        if not rows:
+            await report(f'🤷‍♂️ Никого не собрали. '
+                         f'{"Список участников закрыт" if mode == "members" else "За этот период никто не писал"}.')
+            log_event(session, 'audience', chat.id, chat.title, ok=0, detail=f'{label}: пусто')
+            return
+
+        report_path = write_audience_csv(rows, mode, getattr(chat, 'username', None) or str(chat.id))
+
+        premium = sum(1 for row in rows if row['премиум'])
+        with_username = sum(1 for row in rows if row['username'])
+
+        summary = (f'✅ <b>Сбор закончен</b> — {label}\n\n'
+                   f'Чат: {chat.title}\n'
+                   f'Собрано людей: <b>{len(rows)}</b>\n'
+                   f'С юзернеймом: <b>{with_username}</b>\n'
+                   f'С премиумом: <b>{premium}</b>')
+
+        if mode == 'active' and rows:
+            summary += f'\nСамый активный: <b>{rows[0]["сообщений"]}</b> сообщений'
+        if job['stop']:
+            summary += '\n\n⚠️ Остановлено досрочно — собранное сохранено'
+        if mode == 'members' and len(rows) >= AUDIENCE_MAX_MEMBERS:
+            summary += (f'\n\n⚠️ Telegram отдаёт не больше {AUDIENCE_MAX_MEMBERS} участников, '
+                        f'остальные недоступны')
+
+        if progress:
+            try:
+                await progress.edit(summary)
+            except Exception:
+                await report(summary)
+        else:
+            await report(summary)
+
+        await manager.send_document(reply_to.chat.id, report_path,
+                                    caption=f'📄 {label} — {chat.title}')
+
+        log_event(session, 'audience', chat.id, chat.title, ok=1,
+                  detail=f'{label}: {len(rows)} человек')
+
+    except PeerFlood as e:
+        mark_limited(session, 'PEER_FLOOD при сборе аудитории')
+        log_event(session, 'audience', chat.id, chat.title, ok=0, detail='PEER_FLOOD')
+        await report(f'⛔️ <b>Аккаунт ограничен Telegram</b> (PEER_FLOOD)\n\n'
+                     f'Сбор остановлен. Подробности у @spambot.\n\n<pre>{e}</pre>')
+
+    except FloodWait as e:
+        log_event(session, 'audience', chat.id, chat.title, ok=0, detail=f'FLOOD_WAIT {e.value}')
+        await report(f'⏳ Telegram просит подождать {e.value} сек — сбор прерван.\n'
+                     f'Попробуй позже или с другого аккаунта.')
+
+    except Exception as e:
+        print(f'[audience] {e}')
+        log_event(session, 'audience', chat.id, chat.title, ok=0, detail=e)
+        await report(f'⛔️ Сбор прервался ошибкой\n\n<pre>{e}</pre>')
+
+    finally:
+        finish_job(job)
+        await remove_handler(reply_to.chat.id)
 
 
 def setup_worker(app):
